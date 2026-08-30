@@ -169,22 +169,19 @@ Serwer jest zarejestrowany **globalnie** (user scope), więc jest dostępny w ka
 projekcie, a nie tylko tutaj:
 
 ```bash
-claude mcp add agent-router -s user -e AGENT_ROUTER_SANDBOX=danger-full-access -- node "C:/Users/moskw/Documents/ChatGPT/Agent Router MCP/tools/agent-router/dist/index.js"
+claude mcp add agent-router -s user -e AGENT_ROUTER_SANDBOX=danger-full-access -- node "C:/Users/moskw/Documents/ChatGPT/Agent Router MCP/dist/index.js"
 ```
 
 Reguły z tego pliku są zduplikowane w `~/.claude/CLAUDE.md`, żeby obowiązywały
 także poza tym repozytorium. **Zmieniając je tutaj, zaktualizuj tam.**
 
 W repo nie ma `.mcp.json` — ten sam serwer w dwóch scope'ach powoduje ostrzeżenie
-o konflikcie w `claude mcp list`. Wariant projektowy jest opisany w
-[README routera](tools/agent-router/README.md).
+o konflikcie w `claude mcp list`.
 
 ## Uruchamianie i rozwój
 
-Kod routera: [tools/agent-router](tools/agent-router/).
-
 ```bash
-cd tools/agent-router && npm install && npm run build
+npm install && npm run build
 ```
 
 Po każdej zmianie w `src/` przebuduj (`npm run build`) i przeładuj MCP server —
@@ -193,5 +190,8 @@ Claude Code uruchamia skompilowany `dist/index.js`.
 Testy (nie zużywają quota Codexa — używają atrapy app-servera):
 
 ```bash
-cd tools/agent-router && npm test
+npm test
 ```
+
+Pełna dokumentacja narzędzia: [README.md](README.md).
+Zasady dla współtwórców: [CONTRIBUTING.md](CONTRIBUTING.md).

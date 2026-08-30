@@ -12,6 +12,17 @@ interface PendingRequest {
   method: string;
 }
 
+/**
+ * Codex reports a missing login as a bare "authentication required", which tells
+ * the caller what is wrong but not what to do. The fix is always the same.
+ */
+function explainError(message: string): string {
+  if (/authentication required|not logged in|unauthorized/i.test(message)) {
+    return `${message}. Run \`codex login\` (or set an OpenAI API key) and try again.`;
+  }
+  return message;
+}
+
 export class CodexRpcError extends Error {
   constructor(
     message: string,
@@ -121,7 +132,7 @@ export class CodexClient extends EventEmitter {
       if (msg.error) {
         pending.reject(
           new CodexRpcError(
-            msg.error.message ?? `${pending.method} failed`,
+            explainError(msg.error.message ?? `${pending.method} failed`),
             msg.error.code,
             msg.error.data,
           ),

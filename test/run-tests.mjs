@@ -291,6 +291,26 @@ await withServer("success", {}, async (call) => {
 });
 
 console.log("");
+console.log("concurrent delegations");
+await withServer("success", {}, async (call) => {
+  const [a, b] = await Promise.all([
+    call("codex_delegate", { task: "Task A", workingDirectory: cwd, waitSeconds: 20 }),
+    call("codex_delegate", { task: "Task B", workingDirectory: cwd, waitSeconds: 20 }),
+  ]);
+  check("both complete", a.data.status === "completed" && b.data.status === "completed",
+    `${a.data.status} / ${b.data.status}`);
+  check("each gets its own taskId", a.data.taskId !== b.data.taskId);
+  // Turn completion is routed by threadId, so two in-flight turns must never
+  // share one — otherwise one delegation would resolve with the other's result.
+  check("each gets its own Codex thread", a.data.threadId !== b.data.threadId,
+    `${a.data.threadId} / ${b.data.threadId}`);
+  check("results are not crossed", a.data.originalTask === "Task A" && b.data.originalTask === "Task B");
+
+  const list = await call("codex_task_status");
+  check("both are tracked", list.data.tasks.length >= 2);
+});
+
+console.log("");
 console.log("writes rejected by the sandbox");
 await withServer("write_blocked", {}, async (call) => {
   const { data } = await call("codex_delegate", {
