@@ -1,5 +1,8 @@
 # codex-router-mcp
 
+[![CI](https://github.com/Marczelloo/agent-router-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Marczelloo/agent-router-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 An MCP server that puts guardrails around delegating work to OpenAI Codex.
 
 Codex already ships its own MCP server (`codex mcp-server`), and it exposes two
