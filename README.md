@@ -48,9 +48,33 @@ claude mcp add codex-router -s user -- node "/absolute/path/to/dist/index.js"
 `-s user` makes it available in every project. A relative path only resolves
 from the directory the client was started in, so use an absolute one.
 
-To give the model a policy for *when* to delegate — not just the ability to —
-copy the rules from [CLAUDE.md](CLAUDE.md) into your global agent instructions.
-Without them the model sees ten tools and no guidance.
+## Give the model a policy
+
+Installing the tools gives the model the *ability* to delegate. It still needs a
+policy for *when*. Put something like this in your global agent instructions —
+without it the model sees ten tools and no guidance:
+
+> You are the tech lead. Codex is an external subagent; you decide what to
+> delegate.
+>
+> - Delegate work that is self-contained, mechanical and narrowly scoped —
+>   migrations, refactors that follow a pattern, filling in tests, boilerplate.
+>   Do it yourself when it needs architectural judgement, context from the
+>   conversation, or is small enough that delegating costs more than it saves.
+> - Check `codex_get_limits` before anything large. Pick the model and reasoning
+>   effort from `codex_get_models` to match the difficulty; never guess ids.
+> - Use `isolation: "worktree"` for large, risky or experimental work, or when
+>   there is uncommitted work that must not be lost.
+> - `status: "running"` means Codex is still working. Poll `codex_task_status`;
+>   never delegate the same task twice.
+> - Always review what Codex produced — changed files, diff, then the code — and
+>   check it stayed inside `scope`. Send corrections through `codex_continue`.
+> - On `quota_exhausted`, read `remainingWork` and finish the task yourself.
+>   Never wait for a quota reset and never retry in a loop.
+> - If `failedFileChanges` is present, those files were **not** written. Do not
+>   review them.
+
+[CLAUDE.md](CLAUDE.md) is the full version this repository runs on (in Polish).
 
 ## Tools
 

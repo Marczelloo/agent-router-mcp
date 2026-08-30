@@ -169,7 +169,7 @@ Serwer jest zarejestrowany **globalnie** (user scope), więc jest dostępny w ka
 projekcie, a nie tylko tutaj:
 
 ```bash
-claude mcp add agent-router -s user -e AGENT_ROUTER_SANDBOX=danger-full-access -- node "C:/Users/moskw/Documents/ChatGPT/Agent Router MCP/dist/index.js"
+claude mcp add codex-router -s user -- node "/absolute/path/to/repo/dist/index.js"
 ```
 
 Reguły z tego pliku są zduplikowane w `~/.claude/CLAUDE.md`, żeby obowiązywały
