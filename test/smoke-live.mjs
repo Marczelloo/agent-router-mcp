@@ -35,10 +35,17 @@ async function call(name) {
 }
 
 const models = await call("codex_get_models");
-console.log(`\nmodels (${models.models.length}), default = ${models.defaultModel}`);
-for (const m of models.models) {
-  console.log(`  ${m.id.padEnd(16)} efforts: ${m.reasoningEfforts.map((r) => r.effort).join(", ")}`);
+console.log(`\nrecommended models, default = ${models.defaultModel} / ${models.defaultEffort}`);
+for (const m of models.recommended) {
+  const efforts = m.available ? m.reasoningEfforts.map((r) => r.effort).join(", ") : "NOT AVAILABLE";
+  console.log(`  ${m.id.padEnd(14)} ${m.tier.padEnd(9)} efforts: ${efforts}`);
 }
+if (models.otherModels.length > 0) {
+  console.log(`other models: ${models.otherModels.map((m) => m.id).join(", ")}`);
+}
+
+const server = await call("codex_server");
+console.log(`\ncodex ${server.appServer.codexVersion ?? "?"} (pid ${server.appServer.pid})`);
 
 const limits = await call("codex_get_limits");
 console.log(`\nplan: ${limits.planType}   quota: ${limits.quota.state}`);

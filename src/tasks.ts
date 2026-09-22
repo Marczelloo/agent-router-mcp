@@ -18,7 +18,7 @@ export interface TaskFileChange {
   movedTo?: string | null;
 }
 
-export type TaskKind = "delegation" | "review";
+export type TaskKind = "delegation" | "review" | "image";
 export type Isolation = "none" | "worktree";
 
 export interface TaskWorktree {
@@ -40,6 +40,26 @@ export interface Checkpoint {
   phase: "pre-turn" | "post-turn" | "pre-restore";
   turnIndex: number;
   createdAt: string;
+}
+
+export interface GeneratedImage {
+  /** Codex item id. */
+  id: string;
+  path: string;
+  bytes: number;
+  width: number | null;
+  height: number | null;
+  mimeType: string;
+  revisedPrompt: string | null;
+  /** Share of pixels that are not fully opaque; 0 for images without alpha. */
+  transparentPercent: number;
+}
+
+/** Something the watchdog or a forced interrupt did to a task, kept for the record. */
+export interface Intervention {
+  at: string;
+  action: "reconciled" | "stalled" | "auto-interrupted" | "forced" | "app-server-restarted";
+  reason: string;
 }
 
 export interface TaskTurn {
@@ -91,6 +111,32 @@ export interface TaskRecord {
 
   error: { message: string; codexErrorInfo: unknown } | null;
   quotaAtFailure: NormalizedLimits | null;
+
+  // Liveness, maintained by the router while a turn runs.
+  /** Last event of any kind Codex sent for this thread. */
+  lastActivityAt: string | null;
+  /** Past this the watchdog interrupts the turn. Null means no ceiling. */
+  turnDeadlineAt: string | null;
+  /** Last thread status Codex reported (idle, active, systemError, notLoaded). */
+  threadStatus: string | null;
+  /** Set while Codex waits on an approval or user input that nobody can give. */
+  blockedOn: string | null;
+  blockedSince: string | null;
+  interventions: Intervention[];
+  /** Model-policy notes (capped effort, off-policy model) to surface once. */
+  notes: string[];
+
+  // Image generation.
+  images: GeneratedImage[];
+  failedImages: { id: string; reason: string; resetsAt: string | null }[];
+  imageRequest: {
+    outputPaths: string[];
+    count: number;
+    transparentBackground: boolean;
+    overwrite: boolean;
+  } | null;
+  /** Image and failure counts when the current turn began. */
+  imageBaseline: { images: number; failed: number } | null;
 }
 
 let counter = 0;
@@ -156,6 +202,17 @@ export class TaskStore {
       tokenUsage: null,
       error: null,
       quotaAtFailure: null,
+      lastActivityAt: null,
+      turnDeadlineAt: null,
+      threadStatus: null,
+      blockedOn: null,
+      blockedSince: null,
+      interventions: [],
+      notes: [],
+      images: [],
+      failedImages: [],
+      imageRequest: null,
+      imageBaseline: null,
     };
     this.tasks.set(record.taskId, record);
     this.persist();
@@ -180,6 +237,15 @@ export class TaskStore {
   touch(task: TaskRecord): void {
     task.updatedAt = new Date().toISOString();
     this.persist();
+  }
+
+  intervene(task: TaskRecord, action: Intervention["action"], reason: string): void {
+    task.interventions.push({ at: new Date().toISOString(), action, reason });
+    this.touch(task);
+  }
+
+  running(): TaskRecord[] {
+    return [...this.tasks.values()].filter((t) => t.status === "running");
   }
 
   addCheckpoint(task: TaskRecord, checkpoint: Checkpoint): void {
@@ -237,12 +303,18 @@ export class TaskStore {
       const raw = JSON.parse(fs.readFileSync(config.stateFile, "utf8")) as {
         tasks?: TaskRecord[];
       };
-      for (const task of raw.tasks ?? []) {
+      for (const stored of raw.tasks ?? []) {
+        const task = migrate(stored);
         // A task that was in flight when the router died can never resume its
         // turn stream; surface it as interrupted rather than eternally running.
         if (task.status === "running" || task.status === "pending") {
           task.status = "interrupted";
           task.activeTurnId = null;
+          task.interventions.push({
+            at: new Date().toISOString(),
+            action: "app-server-restarted",
+            reason: "The router restarted while this turn was running.",
+          });
         }
         this.tasks.set(task.taskId, task);
       }
@@ -252,16 +324,66 @@ export class TaskStore {
     }
   }
 
+  private persistTimer: NodeJS.Timeout | null = null;
+
+  /**
+   * Coalesce writes: a busy turn emits an event every few milliseconds, and
+   * rewriting the whole state file on each one is wasted I/O.
+   */
   private persist(): void {
+    if (this.persistTimer) return;
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      this.flush();
+    }, 250);
+    this.persistTimer.unref?.();
+  }
+
+  flush(): void {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
     try {
       fs.mkdirSync(path.dirname(config.stateFile), { recursive: true });
       // Keep the file bounded; old tasks are of no further use.
       const tasks = this.list().slice(0, 200);
-      fs.writeFileSync(config.stateFile, JSON.stringify({ tasks }, null, 2), "utf8");
+      const tmp = `${config.stateFile}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ tasks }, null, 2), "utf8");
+      // Write-then-rename, so a crash mid-write cannot leave a truncated file.
+      fs.renameSync(tmp, config.stateFile);
     } catch (err) {
       debugLog("could not persist task state:", (err as Error).message);
     }
   }
+}
+
+/** Fill in fields added by later versions, so an old state file still loads. */
+function migrate(task: TaskRecord): TaskRecord {
+  const defaults: Partial<TaskRecord> = {
+    kind: "delegation",
+    isolation: "none",
+    worktree: null,
+    checkpoints: [],
+    reviewOf: null,
+    failedFileChanges: [],
+    lastActivityAt: null,
+    turnDeadlineAt: null,
+    threadStatus: null,
+    blockedOn: null,
+    blockedSince: null,
+    interventions: [],
+    notes: [],
+    images: [],
+    failedImages: [],
+    imageRequest: null,
+    imageBaseline: null,
+  };
+  for (const [key, value] of Object.entries(defaults)) {
+    if ((task as any)[key] === undefined) (task as any)[key] = value;
+  }
+  if (!task.requestedDirectory) task.requestedDirectory = task.workingDirectory;
+  return task;
 }
 
 /** Files touched, derived from fileChange items and, as a fallback, the turn diff. */

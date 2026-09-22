@@ -16,6 +16,7 @@ import os from "node:os";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
+import jpeg from "jpeg-js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const entry = path.join(here, "..", "dist", "index.js");
@@ -59,13 +60,14 @@ async function withServer(scenario, env, fn) {
   });
   const client = new Client({ name: "agent-router-tests", version: "1.0.0" });
   await client.connect(transport);
-  const call = async (name, args = {}) => {
-    const res = await client.callTool({ name, arguments: args });
-    const text = res.content.map((c) => c.text).join("\n");
+  const call = async (name, args = {}, options = undefined) => {
+    const res = await client.callTool({ name, arguments: args }, undefined, options);
+    const text = res.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
+    const images = res.content.filter((c) => c.type === "image");
     try {
-      return { isError: res.isError ?? false, data: JSON.parse(text), text };
+      return { isError: res.isError ?? false, data: JSON.parse(text), text, images };
     } catch {
-      return { isError: res.isError ?? false, data: null, text };
+      return { isError: res.isError ?? false, data: null, text, images };
     }
   };
   try {
@@ -108,17 +110,65 @@ function samePath(a, b) {
 
 // ---------------------------------------------------------------- tests
 
-console.log("\ncodex_get_models");
+console.log("\nmodel policy");
 await withServer("success", {}, async (call) => {
   const { data } = await call("codex_get_models");
-  check("returns models from the live catalogue", data.models?.length === 2);
-  check("marks the default model", data.defaultModel === "fake-large");
+  const byId = Object.fromEntries(data.recommended.map((m) => [m.id, m]));
+  check("recommends the three policy models", ["gpt-6-luna", "gpt-6-sol", "gpt-6-astra"].every((id) => byId[id]));
+  check("all three are available in the live catalogue", data.recommended.every((m) => m.available));
+  check("the default is gpt-6-sol", data.defaultModel === "gpt-6-sol");
+  const efforts = (id) => byId[id].reasoningEfforts.map((r) => r.effort).join(",");
+  check("sol is capped at high", efforts("gpt-6-sol") === "low,medium,high", efforts("gpt-6-sol"));
+  check("astra is capped at high", efforts("gpt-6-astra") === "low,medium,high", efforts("gpt-6-astra"));
+  check("luna may go to xhigh", efforts("gpt-6-luna") === "low,medium,high,xhigh", efforts("gpt-6-luna"));
+  check("tiers are labelled", byId["gpt-6-luna"].tier === "fast" && byId["gpt-6-astra"].tier === "frontier");
+  check("each recommended model says what it is for", data.recommended.every((m) => m.useFor.length > 10));
+  check("models outside the policy are listed separately", data.otherModels.some((m) => m.id === "gpt-5.5"));
+
+  const byDefault = await call("codex_delegate", { task: "x", workingDirectory: cwd, waitSeconds: 20 });
+  check("no model named -> gpt-6-sol", byDefault.data.model === "gpt-6-sol", byDefault.data.model);
+  check("no effort named -> medium", byDefault.data.reasoningEffort === "medium", byDefault.data.reasoningEffort);
+
+  const alias = await call("codex_delegate", { task: "x", workingDirectory: cwd, model: "astra", waitSeconds: 20 });
+  check("aliases resolve (astra -> gpt-6-astra)", alias.data.model === "gpt-6-astra", alias.data.model);
+
+  const tier = await call("codex_delegate", { task: "x", workingDirectory: cwd, model: "fast", waitSeconds: 20 });
+  check("tier aliases resolve (fast -> gpt-6-luna)", tier.data.model === "gpt-6-luna", tier.data.model);
+
+  const capped = await call("codex_delegate", {
+    task: "x", workingDirectory: cwd, model: "gpt-6-sol", reasoningEffort: "max", waitSeconds: 20,
+  });
+  check("an effort above the cap is clamped, not refused", capped.data.status === "completed", capped.text.slice(0, 200));
+  check("sol max -> high", capped.data.reasoningEffort === "high", capped.data.reasoningEffort);
+  check("the clamp is reported", (capped.data.notes ?? []).some((n) => /capped at "high"/.test(n)));
+
+  const lunaX = await call("codex_delegate", {
+    task: "x", workingDirectory: cwd, model: "luna", reasoningEffort: "xhigh", waitSeconds: 20,
+  });
+  check("luna accepts xhigh unchanged", lunaX.data.reasoningEffort === "xhigh" && !lunaX.data.notes, JSON.stringify(lunaX.data.notes));
+
+  const lunaMax = await call("codex_delegate", {
+    task: "x", workingDirectory: cwd, model: "luna", reasoningEffort: "max", waitSeconds: 20,
+  });
+  check("luna max -> xhigh", lunaMax.data.reasoningEffort === "xhigh", lunaMax.data.reasoningEffort);
+
+  const offPolicy = await call("codex_delegate", {
+    task: "x", workingDirectory: cwd, model: "gpt-5.5", waitSeconds: 20,
+  });
+  check("a model outside the policy still runs", offPolicy.data.status === "completed");
   check(
-    "exposes per-model reasoning efforts",
-    JSON.stringify(data.models[0].reasoningEfforts.map((r) => r.effort)) ===
-      JSON.stringify(["low", "high"]),
+    "but carries a note steering back to the policy",
+    (offPolicy.data.notes ?? []).some((n) => /outside the router's model policy/.test(n)),
   );
-  check("small model advertises only its own efforts", data.models[1].reasoningEfforts.length === 1);
+
+  const cont = await call("codex_continue", {
+    taskId: byDefault.data.taskId, instruction: "again", reasoningEffort: "ultra", waitSeconds: 20,
+  });
+  check(
+    "codex_continue caps an effort-only change against the task's model",
+    cont.data.reasoningEffort === "high",
+    cont.data.reasoningEffort,
+  );
 });
 
 console.log("\ncodex_get_limits");
@@ -140,13 +190,13 @@ await withServer("success", {}, async (call) => {
     task: "Create hello.txt",
     workingDirectory: cwd,
     scope: "only hello.txt",
-    model: "fake-large",
+    model: "gpt-6-astra",
     reasoningEffort: "high",
     waitSeconds: 20,
   });
   check("status is completed", data.status === "completed", `got ${data.status}`);
   check("carries a Codex threadId", typeof data.threadId === "string" && data.threadId.length > 0);
-  check("records the chosen model", data.model === "fake-large");
+  check("records the chosen model", data.model === "gpt-6-astra");
   check("records the chosen reasoning effort", data.reasoningEffort === "high");
   check("summary is the final agent message", data.summary?.includes("Created hello.txt"));
   check(
@@ -276,18 +326,37 @@ await withServer("success", {}, async (call) => {
     model: "not-a-real-model",
   });
   check("rejects an unknown model", badModel.isError === true);
-  check("lists valid models in the error", /fake-large/.test(badModel.text));
+  check("the error recommends policy models", /Recommended: .*gpt-6-sol/.test(badModel.text), badModel.text.slice(0, 200));
 
   const badEffort = await call("codex_delegate", {
     task: "x",
     workingDirectory: cwd,
-    model: "fake-small",
-    reasoningEffort: "high",
+    model: "gpt-6-luna",
+    reasoningEffort: "banana",
   });
   check("rejects an effort the model does not support", badEffort.isError === true);
+  check("and lists the efforts it allows", /low, medium, high, xhigh/.test(badEffort.text), badEffort.text.slice(0, 200));
 
   const unknownTask = await call("codex_task_status", { taskId: "nope" });
   check("rejects an unknown taskId", unknownTask.isError === true);
+});
+
+console.log("");
+console.log("a turn that outlives waitSeconds still finishes");
+await withServer("slow_complete", {}, async (call) => {
+  const { data } = await call("codex_delegate", { task: "Long task", workingDirectory: cwd, waitSeconds: 1 });
+  check("returns running while the caller waits", data.status === "running", data.status);
+  await new Promise((r) => setTimeout(r, 3500));
+  const later = await call("codex_task_status", { taskId: data.taskId });
+  check(
+    "becomes completed once Codex finishes, with nobody waiting",
+    later.data.status === "completed",
+    later.data.status,
+  );
+  check("completedAt is recorded", Boolean(later.data.timestamps?.completedAt));
+  check("the late result is captured", /Finished the long task/.test(later.data.summary ?? ""));
+  const more = await call("codex_continue", { taskId: data.taskId, instruction: "one more thing", waitSeconds: 1 });
+  check("the task is not bricked — it accepts a follow-up", more.isError === false, more.text.slice(0, 160));
 });
 
 console.log("");
@@ -313,9 +382,12 @@ await withServer("success", {}, async (call) => {
 console.log("");
 console.log("writes rejected by the sandbox");
 await withServer("write_blocked", {}, async (call) => {
+  // In a git repository the router can verify from snapshots that nothing was
+  // written, which is what entitles it to say so.
+  const repo = makeRepo();
   const { data } = await call("codex_delegate", {
     task: "Create greeting.txt",
-    workingDirectory: cwd,
+    workingDirectory: repo.dir,
     waitSeconds: 20,
   });
   check("the turn still reports as completed", data.status === "completed", data.status);
@@ -569,16 +641,16 @@ await withServer("success", {}, async (call) => {
     task: "Rewrite the parser",
     workingDirectory: repo.dir,
     scope: "only parser.js",
-    model: "fake-large",
+    model: "gpt-6-sol",
     waitSeconds: 20,
   });
   const reviewed = await call("codex_review", {
     taskId: worked.data.taskId,
-    model: "fake-small",
+    model: "gpt-6-luna",
     waitSeconds: 20,
   });
   check("the review runs", reviewed.data.status === "completed");
-  check("a different model is used", reviewed.data.model === "fake-small");
+  check("a different model is used", reviewed.data.model === "gpt-6-luna");
   check("the review is linked to the task", reviewed.data.reviewOf?.taskId === worked.data.taskId);
   check(
     "the reviewer is told what the task was",
@@ -600,6 +672,395 @@ await withServer("success", {}, async (call) => {
   });
   check("baseBranch without a branch is rejected", missingBranch.isError === true);
 });
+
+// ================================================================ control
+
+const FAST_WATCHDOG = {
+  AGENT_ROUTER_WATCHDOG_INTERVAL_SECONDS: "0.3",
+  AGENT_ROUTER_INTERRUPT_GRACE_SECONDS: "1",
+};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+console.log("");
+console.log("codex_task_status can wait instead of polling");
+await withServer("slow_complete", {}, async (call) => {
+  const { data } = await call("codex_delegate", { task: "Long task", workingDirectory: cwd, waitSeconds: 1 });
+  check("delegate hands back running", data.status === "running", data.status);
+  check("running results carry live progress", typeof data.progress?.health === "string", JSON.stringify(data.progress));
+  check("progress reports how long it has run", typeof data.progress?.runningSeconds === "number");
+  check("nextStep says to wait, not re-delegate", /waitSeconds/.test(data.nextStep ?? "") && /do not re-delegate/.test(data.nextStep ?? ""));
+  const waited = await call("codex_task_status", { taskId: data.taskId, waitSeconds: 10 });
+  check("waitSeconds blocks until the task finishes", waited.data.status === "completed", waited.data.status);
+  check("and returns the final result", /Finished the long task/.test(waited.data.summary ?? ""));
+});
+
+console.log("");
+console.log("blocking calls send MCP progress notifications");
+await withServer("slow_complete", { AGENT_ROUTER_PROGRESS_INTERVAL_SECONDS: "0.5" }, async (call) => {
+  const events = [];
+  const { data } = await call(
+    "codex_delegate",
+    { task: "Long task", workingDirectory: cwd, waitSeconds: 10 },
+    { onprogress: (p) => events.push(p), resetTimeoutOnProgress: true },
+  );
+  check("the call still returns its result", data.status === "completed", data.status);
+  check("progress arrived while it blocked", events.length >= 2, String(events.length));
+  check("progress counts up", events.length >= 2 && events[events.length - 1].progress > events[0].progress);
+  check("and says what is happening", /Codex is working/.test(events[0]?.message ?? ""), events[0]?.message);
+
+  const quiet = [];
+  await call("codex_get_models", {}, { onprogress: (p) => quiet.push(p) });
+  check("instant calls send none", quiet.length === 0, String(quiet.length));
+});
+
+console.log("");
+console.log("default wait stays under the common 60s client timeout");
+await withServer("slow", {}, async (call) => {
+  const t0 = Date.now();
+  const { data } = await call("codex_delegate", { task: "Never ending", workingDirectory: cwd });
+  const took = (Date.now() - t0) / 1000;
+  check("returns running on its own, before 60s", data.status === "running" && took < 58, `${took.toFixed(1)}s`);
+  await call("codex_interrupt", { taskId: data.taskId });
+});
+
+console.log("");
+console.log("a lost turn/completed is recovered from the thread's real state");
+await withServer("lost_completion", {}, async (call) => {
+  const { data } = await call("codex_delegate", { task: "Quiet task", workingDirectory: cwd, waitSeconds: 1 });
+  check("looks running at first (the completion never arrived)", data.status === "running", data.status);
+  await sleep(2500); // the thread/status idle signal triggers a reconcile
+  const later = await call("codex_task_status", { taskId: data.taskId });
+  check("reconciled to completed without a turn/completed", later.data.status === "completed", later.data.status);
+  check(
+    "the reconciliation is recorded",
+    (later.data.interventions ?? []).some((i) => i.action === "reconciled"),
+    JSON.stringify(later.data.interventions),
+  );
+  const more = await call("codex_continue", { taskId: data.taskId, instruction: "next", waitSeconds: 1 });
+  check("and the task accepts a follow-up", more.isError === false, more.text.slice(0, 160));
+});
+
+console.log("");
+console.log("codex_interrupt when Codex ignores the interrupt");
+await withServer("unresponsive", FAST_WATCHDOG, async (call) => {
+  const { data } = await call("codex_delegate", { task: "Hang", workingDirectory: cwd, waitSeconds: 1 });
+  check("starts running", data.status === "running", data.status);
+  const t0 = Date.now();
+  const stopped = await call("codex_interrupt", { taskId: data.taskId });
+  check("the task leaves running anyway", stopped.data.status === "interrupted", stopped.data.status);
+  check("the result says it was forced", stopped.data.forced === true, String(stopped.data.forced));
+  check("within the grace period, not forever", Date.now() - t0 < 8000, `${Date.now() - t0}ms`);
+  check(
+    "the forced stop is recorded with a reason",
+    (stopped.data.interventions ?? []).some((i) => i.action === "forced" && /did not confirm/.test(i.reason)),
+  );
+  const again = await call("codex_continue", { taskId: data.taskId, instruction: "retry", waitSeconds: 1 });
+  check("the task is usable again after a forced stop", again.isError === false, again.text.slice(0, 160));
+});
+
+console.log("");
+console.log("codex_interrupt when Codex confirms");
+await withServer("slow", {}, async (call) => {
+  const { data } = await call("codex_delegate", { task: "Never ending", workingDirectory: cwd, waitSeconds: 1 });
+  const stopped = await call("codex_interrupt", { taskId: data.taskId });
+  check("interrupted", stopped.data.status === "interrupted", stopped.data.status);
+  check("not forced — Codex confirmed", stopped.data.forced === false, String(stopped.data.forced));
+  const idle = await call("codex_interrupt", { taskId: data.taskId });
+  check("interrupting a finished task is a no-op", idle.isError === false && idle.data.status === "interrupted");
+});
+
+console.log("");
+console.log("watchdog: blocked on an approval nobody can give");
+await withServer("blocked", { ...FAST_WATCHDOG, AGENT_ROUTER_BLOCKED_TIMEOUT_SECONDS: "1" }, async (call) => {
+  const { data } = await call("codex_delegate", { task: "Needs approval", workingDirectory: cwd, waitSeconds: 1 });
+  check("running", data.status === "running", data.status);
+  const mid = await call("codex_task_status", { taskId: data.taskId, refresh: false });
+  check("health reports blocked", mid.data.progress?.health === "blocked", JSON.stringify(mid.data.progress));
+  check("and on what", mid.data.progress?.blockedOn === "waitingOnApproval");
+  await sleep(3000);
+  const later = await call("codex_task_status", { taskId: data.taskId });
+  check("auto-interrupted by the watchdog", later.data.status === "interrupted", later.data.status);
+  check(
+    "with the reason recorded",
+    (later.data.interventions ?? []).some((i) => i.action === "auto-interrupted" && /approval/.test(i.reason)),
+    JSON.stringify(later.data.interventions),
+  );
+  check("nextStep explains the interruption", /interrupted \(/.test(later.data.nextStep ?? ""), later.data.nextStep);
+});
+
+console.log("");
+console.log("watchdog: per-turn time limit");
+await withServer("slow", FAST_WATCHDOG, async (call) => {
+  const { data } = await call("codex_delegate", {
+    task: "Runs too long", workingDirectory: cwd, waitSeconds: 1, timeoutSeconds: 1,
+  });
+  check("reports its deadline", typeof data.progress?.deadlineAt === "string");
+  await sleep(3000);
+  const later = await call("codex_task_status", { taskId: data.taskId });
+  check("interrupted once past its deadline", later.data.status === "interrupted", later.data.status);
+  check(
+    "the time limit is given as the reason",
+    (later.data.interventions ?? []).some((i) => /time limit/.test(i.reason)),
+    JSON.stringify(later.data.interventions),
+  );
+});
+
+console.log("");
+console.log("watchdog: silence is flagged, not killed");
+await withServer("slow", { ...FAST_WATCHDOG, AGENT_ROUTER_STALL_SECONDS: "1" }, async (call) => {
+  const { data } = await call("codex_delegate", { task: "Silent command", workingDirectory: cwd, waitSeconds: 1 });
+  await sleep(2500);
+  const later = await call("codex_task_status", { taskId: data.taskId, refresh: false });
+  check("still running — silence alone never kills", later.data.status === "running", later.data.status);
+  check("health is stalled", later.data.progress?.health === "stalled", JSON.stringify(later.data.progress));
+  const stalledNotes = (later.data.interventions ?? []).filter((i) => i.action === "stalled");
+  check("the stall is recorded once, not on every sweep", stalledNotes.length === 1, String(stalledNotes.length));
+  await call("codex_interrupt", { taskId: data.taskId });
+});
+
+console.log("");
+console.log("codex_server");
+await withServer("slow", {}, async (call) => {
+  const idle = await call("codex_server", {});
+  check("status works before any task", idle.isError === false);
+  const { data } = await call("codex_delegate", { task: "Busy", workingDirectory: cwd, waitSeconds: 1 });
+  const status = await call("codex_server", { action: "status" });
+  check("reports the app-server as running", status.data.appServer.running === true);
+  check("reports the Codex version", status.data.appServer.codexVersion === "0.155.1", status.data.appServer.codexVersion);
+  check("lists the running task with its health", status.data.runningTasks.some((t) => t.taskId === data.taskId && t.health));
+  check("exposes the watchdog settings", typeof status.data.watchdog.turnTimeoutSeconds === "number");
+  const pidBefore = status.data.appServer.pid;
+
+  const restarted = await call("codex_server", { action: "restart" });
+  check("restart succeeds", restarted.data.status === "restarted", restarted.text.slice(0, 200));
+  check("names the turns it interrupted", restarted.data.interruptedTasks.includes(data.taskId));
+  check("a new process is running", restarted.data.appServer.running && restarted.data.appServer.pid !== pidBefore);
+
+  const task = await call("codex_task_status", { taskId: data.taskId });
+  check("the lost turn is interrupted, not left running", task.data.status === "interrupted", task.data.status);
+  check("with the restart recorded", (task.data.interventions ?? []).some((i) => i.action === "app-server-restarted"));
+  const works = await call("codex_get_models");
+  check("the router keeps working after a restart", works.isError === false);
+});
+
+// ================================================================ images
+
+console.log("");
+console.log("codex_generate_image");
+await withServer("image", {}, async (call) => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), "agent-router-img-"));
+  const one = await call("codex_generate_image", {
+    prompt: "A red square icon",
+    workingDirectory: out,
+    waitSeconds: 20,
+  });
+  check("completes", one.data.status === "completed", one.text.slice(0, 200));
+  check("is an image task", one.data.kind === "image");
+  check("defaults to the cheap model", one.data.model === "gpt-6-luna" && one.data.reasoningEffort === "low",
+    `${one.data.model}/${one.data.reasoningEffort}`);
+  const img = one.data.images?.[0];
+  check("reports the saved image", Boolean(img));
+  check("in generated-images/<slug>.png by default", img && img.path.endsWith(path.join("generated-images", "a-red-square-icon.png")), img?.path);
+  check("the file exists on disk", img && fs.existsSync(img.path));
+  check("with its real dimensions", img && img.width === 96 && img.height === 64, `${img?.width}x${img?.height}`);
+  check("and the revised prompt", /A red square icon/.test(img?.revisedPrompt ?? ""));
+  check("a preview image is attached", one.images.length === 1 && one.images[0].mimeType === "image/jpeg");
+  check("the preview is real image data", Buffer.from(one.images[0].data, "base64").subarray(0, 2).toString("hex") === "ffd8");
+  check("the empty data-URI noise is stripped from the summary", !/data:image/.test(one.data.summary), one.data.summary);
+
+  const again = await call("codex_generate_image", { prompt: "A red square icon", workingDirectory: out, preview: "none", waitSeconds: 20 });
+  check("never overwrites: a second run gets a suffix", again.data.images?.[0]?.path.endsWith("a-red-square-icon-2.png"), again.data.images?.[0]?.path);
+  check('preview "none" attaches nothing', again.images.length === 0);
+
+  const many = await call("codex_generate_image", {
+    prompt: "Three variants", workingDirectory: out, count: 3, outputPath: "variants/logo.png", waitSeconds: 20,
+  });
+  check("count produces that many images", many.data.images?.length === 3, String(many.data.images?.length));
+  check("numbered from the given file name", many.data.images?.map((i) => path.basename(i.path)).join(",") === "logo-1.png,logo-2.png,logo-3.png",
+    many.data.images?.map((i) => path.basename(i.path)).join(","));
+  check("one preview per image", many.images.length === 3);
+
+  const jpg = await call("codex_generate_image", { prompt: "Photo", workingDirectory: out, outputPath: "photo.jpg", waitSeconds: 20 });
+  const jpgPath = jpg.data.images?.[0]?.path;
+  check("a .jpg output path is transcoded, not mislabelled", jpgPath && fs.readFileSync(jpgPath).subarray(0, 2).toString("hex") === "ffd8");
+  check("and reported as JPEG", jpg.data.images?.[0]?.mimeType === "image/jpeg");
+
+  const ref = await call("codex_generate_image", {
+    prompt: "Edit it", workingDirectory: out, referenceImages: [img.path], waitSeconds: 20,
+  });
+  check("reference images are passed to Codex", /\[refs=1\]/.test(ref.data.images?.[0]?.revisedPrompt ?? ""), ref.data.images?.[0]?.revisedPrompt);
+
+  const badRef = await call("codex_generate_image", { prompt: "x", workingDirectory: out, referenceImages: ["nope.png"] });
+  check("a missing reference image is rejected up front", badRef.isError === true);
+
+  const astra = await call("codex_generate_image", { prompt: "Hard one", workingDirectory: out, model: "astra", reasoningEffort: "max", waitSeconds: 20 });
+  check("model and effort can be overridden, still capped", astra.data.model === "gpt-6-astra" && astra.data.reasoningEffort === "high",
+    `${astra.data.model}/${astra.data.reasoningEffort}`);
+});
+
+console.log("");
+console.log("unrequested transparency is flagged, and the preview shows it");
+await withServer("image_alpha", {}, async (call) => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), "agent-router-img-"));
+  const { data, images } = await call("codex_generate_image", { prompt: "An icon", workingDirectory: out, waitSeconds: 20 });
+  check("still completes — the image exists", data.status === "completed", data.status);
+  check("reports how transparent it is", data.images?.[0]?.transparentPercent === 100, String(data.images?.[0]?.transparentPercent));
+  check("warns that nobody asked for transparency", /unrequested transparency/.test(data.warning ?? ""), data.warning);
+  check("the file itself is left untouched", fs.readFileSync(data.images[0].path)[25] === 6); // still RGBA
+
+  // A near-invisible image over a checkerboard must show the checkerboard, not
+  // flat white — otherwise the preview hides exactly the defect it should reveal.
+  const decoded = jpeg.decode(Buffer.from(images[0].data, "base64"), { useTArray: true });
+  const px = (x, y) => decoded.data[(y * decoded.width + x) * 4 + 1]; // green channel
+  check(
+    "the preview draws transparency as a checkerboard",
+    Math.abs(px(3, 3) - px(15, 3)) > 25,
+    `cell A=${px(3, 3)} cell B=${px(15, 3)}`,
+  );
+
+  const wanted = await call("codex_generate_image", {
+    prompt: "An icon", workingDirectory: out, transparentBackground: true, waitSeconds: 20,
+  });
+  check("no warning when transparency was asked for", !wanted.data.warning, wanted.data.warning);
+});
+
+console.log("");
+console.log("image quota and failures");
+await withServer("image_quota", {}, async (call) => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), "agent-router-img-"));
+  const { data, images } = await call("codex_generate_image", { prompt: "Anything", workingDirectory: out, waitSeconds: 20 });
+  check("an exhausted image quota is quota_exhausted", data.status === "quota_exhausted", data.status);
+  check("with the reset time", /2026|20\d\d-/.test(data.summary ?? ""), data.summary);
+  check("and no pretence that Claude can finish it", /cannot generate images yourself/.test(data.nextStep ?? ""), data.nextStep);
+  check("no preview for an image that does not exist", images.length === 0);
+});
+await withServer("image_none", {}, async (call) => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), "agent-router-img-"));
+  const { data } = await call("codex_generate_image", { prompt: "Anything", workingDirectory: out, waitSeconds: 20 });
+  check("a turn with no image is a failure, not a success", data.status === "failed", data.status);
+  check("with a usable next step", /Rephrase/.test(data.nextStep ?? ""), data.nextStep);
+});
+
+// ================================================================ state file
+
+// ================================================================ review findings
+
+console.log("");
+console.log("a late start reply cannot hijack the next turn");
+await withServer(
+  "slow",
+  { ...FAST_WATCHDOG, FAKE_START_REPLY_DELAY_MS: "4000", FAKE_NO_TURN_STARTED: "1" },
+  async (call) => {
+    // A's start reply is held back for 4s and no turn/started is sent, so the
+    // router only learns A's id through thread/read.
+    const a = await call("codex_delegate", { task: "Turn A", workingDirectory: cwd, waitSeconds: 1 });
+    const stopA = await call("codex_interrupt", { taskId: a.data.taskId });
+    check("A is interrupted before its start reply arrives", stopA.data.status === "interrupted", stopA.data.status);
+    check("and Codex confirmed it", stopA.data.forced === false, String(stopA.data.forced));
+
+    const b = await call("codex_continue", { taskId: a.data.taskId, instruction: "Turn B", waitSeconds: 1 });
+    check("B runs on the same thread", b.data.status === "running", b.data.status);
+    await sleep(2300); // A's stale reply lands now; B's own reply is still pending
+
+    const stopB = await call("codex_interrupt", { taskId: a.data.taskId });
+    check("interrupting B reaches B itself", stopB.data.status === "interrupted" && stopB.data.forced === false,
+      `${stopB.data.status} forced=${stopB.data.forced}`);
+    check(
+      "B is not settled with A's stale outcome",
+      !(stopB.data.interventions ?? []).some((i) => i.action === "reconciled"),
+      JSON.stringify(stopB.data.interventions),
+    );
+  },
+);
+
+console.log("");
+console.log("concurrent image generations never overwrite each other");
+await withServer("image", {}, async (call) => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), "agent-router-img-"));
+  const args = { prompt: "Same file", workingDirectory: out, outputPath: "same.png", preview: "none", waitSeconds: 20 };
+  const [x, y] = await Promise.all([call("codex_generate_image", args), call("codex_generate_image", args)]);
+  const px = x.data.images?.[0]?.path;
+  const py = y.data.images?.[0]?.path;
+  check("both complete", x.data.status === "completed" && y.data.status === "completed");
+  check("they get different files", px && py && px !== py, `${px} / ${py}`);
+  check("both files exist", px && py && fs.existsSync(px) && fs.existsSync(py));
+  check("and the planned name went to exactly one", [px, py].filter((p) => p?.endsWith("same.png")).length === 1);
+});
+
+console.log("");
+console.log("an image follow-up is judged on its own turn");
+await withServer("image_then_quota", {}, async (call) => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), "agent-router-img-"));
+  const first = await call("codex_generate_image", { prompt: "First", workingDirectory: out, preview: "none", waitSeconds: 20 });
+  check("the first turn succeeds", first.data.status === "completed", first.data.status);
+  const next = await call("codex_continue", { taskId: first.data.taskId, instruction: "Another variant", waitSeconds: 20 });
+  check(
+    "a follow-up that hits the image quota is quota_exhausted, not completed",
+    next.data.status === "quota_exhausted",
+    next.data.status,
+  );
+  check("the earlier image is still recorded", next.data.images?.length === 1);
+});
+
+console.log("");
+console.log("model policy edge cases");
+await withServer("success", { AGENT_ROUTER_DEFAULT_MODEL: "gpt-9-not-rolled-out" }, async (call) => {
+  const d = await call("codex_delegate", { task: "x", workingDirectory: cwd, reasoningEffort: "max", waitSeconds: 20 });
+  check("an unavailable default falls back to the account default", d.data.model === "gpt-6-sol", d.data.model);
+  check("whose policy cap still applies", d.data.reasoningEffort === "high", d.data.reasoningEffort);
+  check("and the fallback is explained", (d.data.notes ?? []).some((n) => /not available/.test(n)));
+});
+await withServer("success", { AGENT_ROUTER_DEFAULT_MODEL: "gpt-5.5" }, async (call) => {
+  const m = await call("codex_get_models");
+  check("an off-policy default is advertised as the default", m.data.defaultModel === "gpt-5.5", m.data.defaultModel);
+  const d = await call("codex_delegate", { task: "x", workingDirectory: cwd, waitSeconds: 20 });
+  check("and is what an omitted model actually uses", d.data.model === "gpt-5.5", d.data.model);
+});
+
+console.log("");
+console.log("files written through the shell are still reported");
+await withServer("shell_write", {}, async (call) => {
+  const repo = makeRepo();
+  const { data } = await call("codex_delegate", { task: "Write shell.txt", workingDirectory: repo.dir, waitSeconds: 20 });
+  check("the file really is on disk", fs.existsSync(path.join(repo.dir, "shell.txt")));
+  check(
+    "changedFiles includes it although Codex reported no change",
+    data.changedFiles.includes("shell.txt (add)"),
+    JSON.stringify(data.changedFiles),
+  );
+  check("the source is the working tree, not Codex's own list", data.changeSource === "working-tree", data.changeSource);
+  check("the diff shows it", /shell\.txt/.test(data.diff ?? ""));
+  check("no false claim that nothing was written", !/could not write any files/.test(data.warning ?? ""), data.warning);
+  check("no warning at all — the rejected patch was superseded", !data.warning, data.warning);
+
+  const plain = fs.mkdtempSync(path.join(os.tmpdir(), "agent-router-plain-"));
+  const outside = await call("codex_delegate", { task: "Write shell.txt", workingDirectory: plain, waitSeconds: 20 });
+  check("outside git the source is Codex's own list", outside.data.changeSource === "codex-reported", outside.data.changeSource);
+  check(
+    "and the warning admits it cannot verify, instead of claiming nothing was written",
+    /cannot tell whether/.test(outside.data.warning ?? "") && !/Nothing changed on disk/.test(outside.data.warning ?? ""),
+    outside.data.warning,
+  );
+});
+
+console.log("");
+console.log("state survives a router restart");
+{
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-router-state-"));
+  const stateFile = path.join(stateDir, "tasks.json");
+  let taskId;
+  await withServer("slow", { AGENT_ROUTER_STATE_FILE: stateFile }, async (call) => {
+    const { data } = await call("codex_delegate", { task: "Interrupted by restart", workingDirectory: cwd, waitSeconds: 1 });
+    taskId = data.taskId;
+    await sleep(400); // let the debounced write land
+  });
+  check("the state file is written atomically (no .tmp left behind)", fs.existsSync(stateFile) && !fs.existsSync(`${stateFile}.tmp`));
+  await withServer("success", { AGENT_ROUTER_STATE_FILE: stateFile }, async (call) => {
+    const { data } = await call("codex_task_status", { taskId });
+    check("a task running when the router died comes back interrupted", data.status === "interrupted", data.status);
+    check("with the reason recorded", (data.interventions ?? []).some((i) => i.action === "app-server-restarted"));
+  });
+}
 
 console.log(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed === 0 ? 0 : 1);

@@ -17,7 +17,19 @@ a test that needs a live Codex login is a test most contributors cannot run.
 Every behavioural change needs a case in `test/run-tests.mjs`. If the change
 concerns how the router reacts to Codex, model that reaction in
 `test/fake-app-server.mjs` as a new `FAKE_SCENARIO` rather than mocking inside
-the router.
+the router. The scenarios are listed at the top of that file.
+
+Keep the fake faithful to real Codex behaviour, because the router's bookkeeping
+depends on it: every `thread/start` and every turn gets a fresh id, `thread/read`
+reports the thread's real status and turns, and `thread/status/changed` is sent
+as turns start and end. A fake that reuses one turn id, for example, hides bugs
+in stale-completion handling instead of catching them.
+
+Turn supervision is the most delicate part of the router. Any change to how a
+turn ends — completion, error, interrupt, reconcile, watchdog, app-server exit —
+must keep one invariant: a turn's outcome is processed exactly once, and no task
+can be left in `running`. The "lost completion", "unresponsive" and "blocked"
+scenarios exist to hold that line.
 
 `npm run smoke` is a read-only check against a real `codex app-server`. It
 starts no turn, so it is safe to run, but it is not part of CI.

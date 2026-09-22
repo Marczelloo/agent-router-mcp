@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import path from "node:path";
 import readline from "node:readline";
@@ -10,6 +10,8 @@ interface PendingRequest {
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
   method: string;
+  /** The app-server process the request was sent to. */
+  generation: number;
 }
 
 /**
@@ -48,6 +50,17 @@ export class CodexClient extends EventEmitter {
   private nextId = 0;
   private initializeResult: InitializeResponse | null = null;
   private shuttingDown = false;
+  private restarting = false;
+  private startedAt: number | null = null;
+  private restarts = 0;
+  /**
+   * Each spawned process gets a generation. Requests are tagged with the one
+   * they were sent to, so the death of a replaced process — which can come
+   * seconds after its successor started — fails only its own requests.
+   */
+  private generation = 0;
+  private generations = new WeakMap<ChildProcessWithoutNullStreams, number>();
+  private retiredProcesses = new WeakSet<ChildProcessWithoutNullStreams>();
 
   async ensureStarted(): Promise<void> {
     if (this.child && !this.child.killed) return;
@@ -62,6 +75,65 @@ export class CodexClient extends EventEmitter {
     return this.initializeResult;
   }
 
+  info(): {
+    running: boolean;
+    pid: number | null;
+    startedAt: string | null;
+    uptimeSeconds: number | null;
+    pendingRequests: number;
+    restarts: number;
+    userAgent: string | null;
+    codexHome: string | null;
+  } {
+    const running = Boolean(this.child && !this.child.killed && this.initializeResult);
+    return {
+      running,
+      pid: this.child?.pid ?? null,
+      startedAt: this.startedAt ? new Date(this.startedAt).toISOString() : null,
+      uptimeSeconds: running && this.startedAt ? Math.round((Date.now() - this.startedAt) / 1000) : null,
+      pendingRequests: this.pending.size,
+      restarts: this.restarts,
+      userAgent: this.initializeResult?.userAgent ?? null,
+      codexHome: this.initializeResult?.codexHome ?? null,
+    };
+  }
+
+  /**
+   * Replace a wedged app-server with a fresh one. Threads live on disk, so they
+   * survive this and can be resumed; only turns in flight are lost.
+   */
+  async restart(): Promise<void> {
+    const old = this.child;
+    if (old) {
+      this.restarting = true;
+      const exited = new Promise<void>((resolve) => old.once("exit", () => resolve()));
+      killTree(old);
+      await Promise.race([exited, new Promise((r) => setTimeout(r, 5000))]);
+      // If it has not exited yet, treat it as gone now; its eventual exit event
+      // will find it already retired and leave the new process alone.
+      this.retireProcess(old, "codex app-server was restarted");
+      this.restarting = false;
+    }
+    this.restarts++;
+    await this.ensureStarted();
+  }
+
+  /**
+   * Account for a process that is gone: fail the requests sent to it and, if it
+   * was the current one, report the exit. Runs at most once per process.
+   */
+  private retireProcess(child: ChildProcessWithoutNullStreams, reason: string, code?: number | null, signal?: string | null): void {
+    if (this.retiredProcesses.has(child)) return;
+    this.retiredProcesses.add(child);
+    const deliberate = this.shuttingDown || this.restarting;
+    if (!deliberate) log(reason);
+    this.failAllPending(new Error(reason), this.generations.get(child));
+    if (this.child !== child) return; // already replaced; nothing current depends on it
+    this.child = null;
+    this.initializeResult = null;
+    this.emit("exit", { code: code ?? null, signal: signal ?? null, deliberate });
+  }
+
   private async start(): Promise<void> {
     debugLog("spawning", config.codexBin, config.codexArgs.join(" "));
     const child = spawn(config.codexBin, config.codexArgs, {
@@ -73,20 +145,15 @@ export class CodexClient extends EventEmitter {
       env: process.env,
     });
     this.child = child;
+    this.startedAt = Date.now();
+    this.generations.set(child, ++this.generation);
 
     child.on("error", (err) => {
-      log(`app-server spawn failed: ${err.message}`);
-      this.failAllPending(new Error(`codex app-server failed to start: ${err.message}`));
-      this.child = null;
+      this.retireProcess(child, `codex app-server failed to start: ${err.message}`);
     });
 
     child.on("exit", (code, signal) => {
-      const reason = `codex app-server exited (code=${code} signal=${signal})`;
-      if (!this.shuttingDown) log(reason);
-      this.failAllPending(new Error(reason));
-      this.child = null;
-      this.initializeResult = null;
-      this.emit("exit", { code, signal });
+      this.retireProcess(child, `codex app-server exited (code=${code} signal=${signal})`, code, signal);
     });
 
     child.stderr.setEncoding("utf8");
@@ -96,13 +163,13 @@ export class CodexClient extends EventEmitter {
     rl.on("line", (line) => this.handleLine(line));
 
     const initTimer = setTimeout(() => {
-      this.failAllPending(new Error("codex app-server did not complete initialize in time"));
-      child.kill();
+      this.retireProcess(child, "codex app-server did not complete initialize in time");
+      killTree(child);
     }, config.startupTimeoutMs);
 
     try {
       this.initializeResult = (await this.request<InitializeResponse>("initialize", {
-        clientInfo: { name: "agent-router", title: "Agent Router MCP", version: "0.1.0" },
+        clientInfo: { name: "agent-router", title: "Agent Router MCP", version: "0.2.0" },
         capabilities: { experimentalApi: true, requestAttestation: false },
       })) as InitializeResponse;
       this.notify("initialized", {});
@@ -201,12 +268,14 @@ export class CodexClient extends EventEmitter {
     this.child.stdin.write(`${JSON.stringify(payload)}\n`);
   }
 
-  private failAllPending(error: Error): void {
-    for (const [, pending] of this.pending) {
+  /** Fail pending requests — all of them, or only those sent to one process. */
+  private failAllPending(error: Error, generation?: number): void {
+    for (const [id, pending] of this.pending) {
+      if (generation !== undefined && pending.generation !== generation) continue;
       clearTimeout(pending.timer);
       pending.reject(error);
+      this.pending.delete(id);
     }
-    this.pending.clear();
   }
 
   /** Send a JSON-RPC request. `initialize` is allowed before the handshake completes. */
@@ -225,6 +294,7 @@ export class CodexClient extends EventEmitter {
         reject,
         timer,
         method,
+        generation: this.generation,
       });
       this.write({ jsonrpc: "2.0", id, method, params });
     });
@@ -237,7 +307,19 @@ export class CodexClient extends EventEmitter {
   dispose(): void {
     this.shuttingDown = true;
     this.failAllPending(new Error("agent-router shutting down"));
-    this.child?.kill();
+    if (this.child) killTree(this.child);
     this.child = null;
+  }
+}
+
+/**
+ * On Windows `codex` is launched through a shell, so `child.kill()` only ends
+ * cmd.exe and can orphan the real app-server. Kill the whole tree instead.
+ */
+function killTree(child: ChildProcessWithoutNullStreams): void {
+  if (process.platform === "win32" && child.pid) {
+    spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+  } else {
+    child.kill();
   }
 }

@@ -56,9 +56,15 @@ export const config = {
   quotaLowRemainingPercent: num("AGENT_ROUTER_QUOTA_LOW_PERCENT", 15),
   quotaBlockRemainingPercent: num("AGENT_ROUTER_QUOTA_BLOCK_PERCENT", 2),
 
-  /** How long a delegate/continue call blocks before handing back a pollable taskId. */
-  defaultWaitSeconds: num("AGENT_ROUTER_DEFAULT_WAIT_SECONDS", 240),
+  /**
+   * How long a call blocks before handing back a pollable taskId. Many MCP clients cancel a request after 60 s (the SDK default), so the
+   * default stays under that. The task keeps running either way; callers wait
+   * further with codex_task_status. Raise it only for clients that allow more.
+   */
+  defaultWaitSeconds: num("AGENT_ROUTER_DEFAULT_WAIT_SECONDS", 50),
   maxWaitSeconds: num("AGENT_ROUTER_MAX_WAIT_SECONDS", 1800),
+  /** How often a blocked call sends an MCP progress notification. */
+  progressIntervalSeconds: num("AGENT_ROUTER_PROGRESS_INTERVAL_SECONDS", 10),
 
   /** Startup handshake budget for the child process. */
   startupTimeoutMs: num("AGENT_ROUTER_STARTUP_TIMEOUT_MS", 30_000),
@@ -75,6 +81,28 @@ export const config = {
     path.join(os.homedir(), ".agent-router", "worktrees"),
   /** Snapshot the working tree before and after every turn. */
   checkpoints: process.env.AGENT_ROUTER_CHECKPOINTS !== "off",
+
+  /** Model used when a caller names none. Aliases (luna, sol, astra) work too. */
+  defaultModel: process.env.AGENT_ROUTER_DEFAULT_MODEL ?? "gpt-6-sol",
+
+  /**
+   * Turn watchdog. A turn is "stalled" after this long without any event from
+   * Codex; the router then re-reads the thread to catch a lost completion. A
+   * long silent command can legitimately trip it, so stalling alone never kills.
+   */
+  stallSeconds: num("AGENT_ROUTER_STALL_SECONDS", 180),
+  /** Hard ceiling per turn; past it the router interrupts. 0 disables it. */
+  turnTimeoutSeconds: num("AGENT_ROUTER_TURN_TIMEOUT_SECONDS", 3600),
+  /** How long a turn may wait on an approval or user input nobody can give. */
+  blockedTimeoutSeconds: num("AGENT_ROUTER_BLOCKED_TIMEOUT_SECONDS", 60),
+  watchdogIntervalSeconds: num("AGENT_ROUTER_WATCHDOG_INTERVAL_SECONDS", 15),
+  /** How long codex_interrupt waits for Codex to confirm before forcing. */
+  interruptGraceSeconds: num("AGENT_ROUTER_INTERRUPT_GRACE_SECONDS", 10),
+
+  /** Image generation defaults: the cheapest model is plenty for a tool call. */
+  imageModel: process.env.AGENT_ROUTER_IMAGE_MODEL ?? "gpt-6-luna",
+  imageEffort: process.env.AGENT_ROUTER_IMAGE_EFFORT ?? "low",
+  imagePreviewMaxEdge: num("AGENT_ROUTER_IMAGE_PREVIEW_MAX_EDGE", 768),
 
   /** Best-effort task metadata persistence. */
   stateFile:

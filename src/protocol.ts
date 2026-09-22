@@ -231,6 +231,41 @@ export type ThreadItem =
   | { type: "fileChange"; id: string; changes: FileUpdateChange[]; status: string }
   | { type: string; id: string; [key: string]: unknown };
 
+/** `active` carries flags when the turn is blocked on something only a human could answer. */
+export type ThreadStatus =
+  | { type: "notLoaded" }
+  | { type: "idle" }
+  | { type: "systemError" }
+  | { type: "active"; activeFlags: string[] };
+
+export interface ThreadStatusChangedNotification {
+  threadId: string;
+  status: ThreadStatus;
+}
+
+export interface ThreadReadResponse {
+  thread: Thread & { status: ThreadStatus; turns: Turn[] };
+}
+
+/** Image generation has its own quota, reported per item rather than per turn. */
+export type ImageGenerationFailure =
+  | { type: "usageLimitExceeded"; limitId: string; resetsAt: number | null }
+  | { type: string; [key: string]: unknown };
+
+export interface ImageGenerationItem {
+  type: "imageGeneration";
+  id: string;
+  /** "in_progress" | "completed" | "failed" … — Codex sends snake_case here. */
+  status: string;
+  revisedPrompt: string | null;
+  /** Base64 image data, usually PNG. */
+  result: string;
+  transparentBackground?: boolean | null;
+  failure: ImageGenerationFailure | null;
+  /** Copy Codex keeps under ~/.codex/generated_images. */
+  savedPath?: string;
+}
+
 export interface TurnPlanStep {
   step: string;
   status: "pending" | "inProgress" | "completed";

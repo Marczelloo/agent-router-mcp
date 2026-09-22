@@ -239,6 +239,21 @@ export function diffAgainstBase(dir: string, baseCommit: string): string {
   return tryGit(info.repoRoot, ["diff", `${baseCommit}..${snapshot}`]) ?? "";
 }
 
+/**
+ * What changed on disk between two snapshots (e.g. before and after a turn).
+ * Unlike Codex's own change tracking this also sees files written through shell
+ * commands, which never produce a patch event.
+ */
+export function changedFilesBetween(repoRoot: string, from: string, to: string): string[] | null {
+  const out = tryGit(repoRoot, ["diff", "--name-status", "--no-renames", from, to]);
+  // null means git could not answer — distinct from "nothing changed".
+  return out === null ? null : out.split("\n").filter(Boolean);
+}
+
+export function diffBetween(repoRoot: string, from: string, to: string): string {
+  return tryGit(repoRoot, ["diff", "--no-renames", from, to]) ?? "";
+}
+
 export function changedFilesAgainstBase(dir: string, baseCommit: string): string[] {
   const info = gitInfo(dir);
   if (!info) return [];

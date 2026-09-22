@@ -1,7 +1,7 @@
 {
   "name": "codex-router-mcp",
-  "version": "0.1.0",
-  "description": "MCP server that lets Claude Code delegate coding tasks to OpenAI Codex, with quota preflight, git worktree isolation, checkpoints and cross-review.",
+  "version": "0.2.0",
+  "description": "MCP server that lets Claude Code delegate coding tasks and image generation to OpenAI Codex, with supervised turns, model policy, quota handoff, git worktree isolation, checkpoints and cross-review.",
   "license": "MIT",
   "author": "Marczelloo",
   "homepage": "https://github.com/Marczelloo/agent-router-mcp#readme",
@@ -21,7 +21,9 @@
     "agent",
     "subagent",
     "delegation",
-    "code-review"
+    "code-review",
+    "image-generation",
+    "watchdog"
   ],
   "type": "module",
   "engines": {
@@ -47,10 +49,13 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
+    "jpeg-js": "^0.4.4",
+    "pngjs": "^7.0.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/pngjs": "^6.0.5",
     "typescript": "^5.7.2"
   }
 }

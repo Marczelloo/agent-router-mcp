@@ -216,11 +216,11 @@ export function isQuotaError(
 ): boolean {
   if (!error) return false;
   const info = error.codexErrorInfo;
+  const QUOTA_CODES = ["usageLimitExceeded", "rateLimitExceeded", "sessionBudgetExceeded"];
   if (typeof info === "string") {
-    if (info === "usageLimitExceeded" || info === "sessionBudgetExceeded") return true;
+    if (QUOTA_CODES.includes(info)) return true;
   } else if (info && typeof info === "object") {
-    const key = Object.keys(info)[0];
-    if (key === "usageLimitExceeded" || key === "sessionBudgetExceeded") return true;
+    if (QUOTA_CODES.includes(Object.keys(info)[0])) return true;
   }
   const msg = (error.message ?? "").toLowerCase();
   return (
