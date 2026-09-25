@@ -4,6 +4,7 @@ import path from "node:path";
 import { config, debugLog } from "./config.js";
 import type { NormalizedLimits } from "./limits.js";
 import type { TurnPlanStep } from "./protocol.js";
+import { publicStatus, writeStatus } from "./status.js";
 
 export type TaskStatus =
   | "pending"
@@ -386,6 +387,34 @@ export class TaskStore {
   }
 
   private persistTimer: NodeJS.Timeout | null = null;
+  /** The merged task list of the last full write, for status-only refreshes. */
+  private lastMerged: TaskRecord[] = [];
+  private statusWrittenAt = 0;
+
+  /**
+   * Activity seen only in memory (`lastActivityAt` moves on every Codex event)
+   * does not rewrite the large state file. Refresh just the small public status
+   * file, at most every `statusHeartbeatMs`, so its `lastActivityAt` stays true.
+   */
+  heartbeat(now = Date.now()): void {
+    if (now - this.statusWrittenAt < config.statusHeartbeatMs) return;
+    const byId = new Map(this.lastMerged.map((t) => [t.taskId, t]));
+    for (const id of this.owned) {
+      const task = this.tasks.get(id);
+      if (task) byId.set(id, task);
+    }
+    this.writePublicStatus([...byId.values()], now);
+  }
+
+  private writePublicStatus(tasks: TaskRecord[], now: number): void {
+    this.statusWrittenAt = now;
+    // The public status file must never break the router's own state.
+    try {
+      writeStatus(config.statusFile, publicStatus(tasks, now, config.stallSeconds));
+    } catch (err) {
+      debugLog("could not write the public status file:", (err as Error).message);
+    }
+  }
 
   /**
    * Coalesce writes: a busy turn emits an event every few milliseconds, and
@@ -428,6 +457,8 @@ export class TaskStore {
       fs.writeFileSync(tmp, JSON.stringify({ tasks }), "utf8");
       // Write-then-rename, so a crash mid-write cannot leave a truncated file.
       fs.renameSync(tmp, config.stateFile);
+      this.lastMerged = tasks;
+      this.writePublicStatus(tasks, Date.now());
     } catch (err) {
       debugLog("could not persist task state:", (err as Error).message);
     }

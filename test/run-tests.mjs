@@ -14,7 +14,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFileSync } from "node:child_process";
 import jpeg from "jpeg-js";
 
@@ -1055,6 +1055,7 @@ console.log("state survives a router restart");
     await sleep(400); // let the debounced write land
   });
   check("the state file is written atomically (no .tmp left behind)", fs.existsSync(stateFile) && fs.readdirSync(stateDir).every((f) => !f.endsWith(".tmp")));
+  check("a public status file is written next to it", fs.existsSync(path.join(stateDir, "status.json")));
   await withServer("success", { AGENT_ROUTER_STATE_FILE: stateFile }, async (call) => {
     const { data } = await call("codex_task_status", { taskId });
     check("a task running when the router died comes back interrupted", data.status === "interrupted", data.status);
@@ -1137,6 +1138,52 @@ console.log("two sessions share one state file without losing each other's tasks
   check("the state file keeps both sessions' tasks", [ids.a, ids.b, ids.c].every((id) => stored.includes(id)), JSON.stringify({ ids, stored }));
   check("task ids differ across sessions", new Set([ids.a, ids.b, ids.c]).size === 3);
   check("no temp files are left behind", fs.readdirSync(path.dirname(stateFile)).every((f) => !f.endsWith(".tmp")));
+  const statusFile = path.join(path.dirname(stateFile), "status.json");
+  const status = fs.existsSync(statusFile) ? JSON.parse(fs.readFileSync(statusFile, "utf8")) : { tasks: [] };
+  const listed = status.tasks.map((t) => t.taskId);
+  check("the public status file lists both sessions' tasks", [ids.a, ids.b, ids.c].every((id) => listed.includes(id)), JSON.stringify(listed));
+  check("finished tasks there have their thread and status", status.tasks.every((t) => t.threadId && t.status === "completed"), JSON.stringify(status.tasks));
+}
+
+console.log("");
+console.log("the public status file follows activity that is only kept in memory");
+{
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-router-heartbeat-"));
+  const env = { AGENT_ROUTER_STATE_FILE: path.join(stateDir, "tasks.json"), FAKE_CHATTER_MS: "100", AGENT_ROUTER_STATUS_HEARTBEAT_MS: "300" };
+  await withServer("slow", env, async (call) => {
+    await call("codex_delegate", { task: "A long streaming command", workingDirectory: cwd, waitSeconds: 1 });
+    await sleep(600);
+    const read = () => JSON.parse(fs.readFileSync(path.join(stateDir, "status.json"), "utf8")).tasks[0].lastActivityAt;
+    const first = read();
+    await sleep(1200);
+    const second = read();
+    check("lastActivityAt in status.json moves while output streams", Date.parse(second) > Date.parse(first), `${first} -> ${second}`);
+    check("and stays close to now", Date.now() - Date.parse(second) < 1000, second);
+  });
+}
+
+console.log("");
+console.log("the public status file stays small and private");
+{
+  const { publicStatus, titleOf } = await import(pathToFileURL(path.join(here, "..", "dist", "status.js")).href);
+  const now = Date.parse("2026-09-25T12:00:00Z");
+  const ago = (ms) => new Date(now - ms).toISOString();
+  const record = (id, status, age, extra = {}) => ({
+    taskId: id, kind: "delegation", threadId: `th-${id}`, model: "gpt-6-sol", originalTask: `  \n Count files in ${id}\nsecond line`,
+    workingDirectory: "C:/work", status, createdAt: ago(age), updatedAt: ago(age), startedAt: ago(age), lastActivityAt: ago(age),
+    blockedOn: null, diff: "diff --git a/x b/x", commands: ["secret command"], agentMessages: ["secret message"], ...extra,
+  });
+  const out = publicStatus([record("run", "running", 3 * 3600e3), record("done", "completed", 3600e3), record("old", "failed", 3 * 3600e3)], now, 180);
+  check("version 1 with the stall threshold", out.version === 1 && out.stallSeconds === 180);
+  check("running tasks always, finished ones from the last 2 h", JSON.stringify(out.tasks.map((t) => t.taskId).sort()) === JSON.stringify(["done", "run"]), JSON.stringify(out.tasks.map((t) => t.taskId)));
+  check("the title is the first non-empty line", out.tasks[0].title === "Count files in done" || out.tasks[0].title === "Count files in run", out.tasks[0].title);
+  const keys = new Set(out.tasks.flatMap((t) => Object.keys(t)));
+  check("no task text, diff, commands or messages", ["originalTask", "diff", "commands", "agentMessages"].every((k) => !keys.has(k)), [...keys].join(","));
+  check("a blocked task says so", publicStatus([record("b", "running", 0, { blockedOn: "approval" })], now, 180).tasks[0].blocked === true);
+  const many = Array.from({ length: 60 }, (_, i) => record(`t${String(i).padStart(2, "0")}`, "running", i * 1000));
+  const capped = publicStatus(many, now, 180).tasks;
+  check("at most 50 tasks, newest first", capped.length === 50 && capped[0].taskId === "t00", `${capped.length} ${capped[0]?.taskId}`);
+  check("long titles are cut to 80 characters", [...titleOf("x".repeat(200))].length === 80);
 }
 
 console.log("");

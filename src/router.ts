@@ -1868,7 +1868,10 @@ export class AgentRouter {
       const threadId = params?.threadId;
       if (typeof threadId !== "string") return;
       const task = this.store.byThreadId(threadId);
-      if (task && task.status === "running") task.lastActivityAt = new Date().toISOString();
+      if (task && task.status === "running") {
+        task.lastActivityAt = new Date().toISOString();
+        this.store.heartbeat();
+      }
     });
 
     client.on("notification:turn/started", (params: { threadId: string; turn: Turn }) => {

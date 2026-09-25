@@ -309,6 +309,12 @@ function runTurn(threadId, turn, params) {
     switch (scenario) {
       case "slow":
       case "unresponsive":
+        // FAKE_CHATTER_MS: a long command streaming output — events, but no item finishes.
+        if (process.env.FAKE_CHATTER_MS) {
+          const every = Number(process.env.FAKE_CHATTER_MS);
+          const timer = setInterval(() => notify("item/commandExecution/outputDelta", { threadId, turnId: turn.id, delta: "." }), every);
+          timer.unref?.();
+        }
         return; // never completes on its own
 
       case "lost_completion":

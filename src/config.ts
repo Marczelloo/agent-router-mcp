@@ -124,6 +124,11 @@ export const config = {
    * long silent command can legitimately trip it, so stalling alone never kills.
    */
   stallSeconds: num("AGENT_ROUTER_STALL_SECONDS", 180, 1, DAY_SECONDS),
+  /**
+   * How often activity kept only in memory (a long command streaming output)
+   * refreshes the public status file, so readers do not see a live task as quiet.
+   */
+  statusHeartbeatMs: num("AGENT_ROUTER_STATUS_HEARTBEAT_MS", 10_000, 50, 10 * 60_000),
   /** Hard ceiling per turn; past it the router interrupts. 0 disables it. */
   turnTimeoutSeconds: num("AGENT_ROUTER_TURN_TIMEOUT_SECONDS", 3600, 0, 7 * DAY_SECONDS),
   /** How long a turn may wait on an approval or user input nobody can give. */
@@ -142,6 +147,16 @@ export const config = {
     process.env.AGENT_ROUTER_STATE_FILE ??
     path.join(os.homedir(), ".agent-router", "tasks.json"),
 
+  /**
+   * Small public snapshot of the tasks for other tools (e.g. Agent Pets), written
+   * next to the state file unless set explicitly. See src/status.ts.
+   */
+  statusFile:
+    process.env.AGENT_ROUTER_STATUS_FILE ??
+    path.join(
+      path.dirname(process.env.AGENT_ROUTER_STATE_FILE ?? path.join(os.homedir(), ".agent-router", "tasks.json")),
+      "status.json",
+    ),
 
   /** Set to "true" to mirror app-server stderr into this server's stderr. */
   debug: process.env.AGENT_ROUTER_DEBUG === "true",

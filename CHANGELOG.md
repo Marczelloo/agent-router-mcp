@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Public status file.** Every state write now also writes
+  `~/.agent-router/status.json` (next to the state file; override with
+  `AGENT_ROUTER_STATUS_FILE`), a small versioned snapshot for other tools such
+  as Agent Pets: running tasks plus those finished in the last 2 hours, at most
+  50. It carries only a short title per task, no task text, diffs, commands or
+  messages, plus `lastActivityAt`, `blocked` and `stallSeconds` so a reader can
+  work out a task's health itself. A failed write is logged and never affects
+  the router's own state.
+
 ## 0.3.0
 
 Hardening from a product-readiness audit. Every fix below has a regression test
