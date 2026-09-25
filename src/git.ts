@@ -23,15 +23,25 @@ const GIT_IDENTITY = {
   GIT_COMMITTER_EMAIL: "agent-router@localhost",
 };
 
-function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = {}): string {
+/**
+ * Git runs synchronously, so a wedged command (a stalled clean filter, a lock
+ * held by another tool) would freeze every tool call and the watchdog with it.
+ * The deadline turns that into an ordinary, reportable failure.
+ */
+const GIT_TIMEOUT_MS = 120_000;
+
+function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = {}, opts: { raw?: boolean } = {}): string {
   try {
-    return execFileSync("git", args, {
+    const out = execFileSync("git", args, {
       cwd,
       encoding: "utf8",
       env: { ...process.env, ...GIT_IDENTITY, ...env },
       maxBuffer: 64 * 1024 * 1024,
       stdio: ["ignore", "pipe", "pipe"],
-    }).trim();
+      timeout: GIT_TIMEOUT_MS,
+    });
+    // NUL-delimited output must not be trimmed: a path may start with a space.
+    return opts.raw ? out : out.trim();
   } catch (err) {
     const e = err as { stderr?: Buffer | string; message: string };
     const stderr = typeof e.stderr === "string" ? e.stderr : (e.stderr?.toString() ?? "");
@@ -39,13 +49,34 @@ function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = {}): string {
   }
 }
 
-function tryGit(cwd: string, args: string[], env?: NodeJS.ProcessEnv): string | null {
+function tryGit(
+  cwd: string,
+  args: string[],
+  env?: NodeJS.ProcessEnv,
+  opts?: { raw?: boolean },
+): string | null {
   try {
-    return git(cwd, args, env);
+    return git(cwd, args, env, opts);
   } catch (err) {
     debugLog("git:", (err as Error).message);
     return null;
   }
+}
+
+/**
+ * Git quotes paths with non-ASCII characters in its line output
+ * ("za\305\274..."), so every path listing goes through `-z` instead.
+ */
+function splitNul(out: string | null): string[] {
+  return out ? out.split("\0").filter(Boolean) : [];
+}
+
+/** `--name-status -z` emits "A\0path\0M\0path\0"; rebuild "A\tpath" rows. */
+function nameStatusRows(out: string): string[] {
+  const parts = splitNul(out);
+  const rows: string[] = [];
+  for (let i = 0; i + 1 < parts.length; i += 2) rows.push(`${parts[i]}\t${parts[i + 1]}`);
+  return rows;
 }
 
 export interface GitInfo {
@@ -85,6 +116,10 @@ export function gitInfo(dir: string): GitInfo | null {
  * primitive but it silently omits untracked files, which is exactly what a
  * delegated agent tends to produce.
  *
+ * The throwaway index starts as a copy of the real one. From an empty index,
+ * `add -A` would skip a tracked file that matches .gitignore, and restoring
+ * that snapshot would then leave the file out.
+ *
  * Returns null when the directory is not a git repository.
  */
 export function snapshotCommit(dir: string, message: string): string | null {
@@ -95,6 +130,8 @@ export function snapshotCommit(dir: string, message: string): string | null {
     "index",
   );
   try {
+    const realIndex = path.resolve(info.repoRoot, git(info.repoRoot, ["rev-parse", "--git-path", "index"]));
+    if (fs.existsSync(realIndex)) fs.copyFileSync(realIndex, tmpIndex);
     const env = { GIT_INDEX_FILE: tmpIndex };
     git(info.repoRoot, ["add", "-A", "--", "."], env);
     const tree = git(info.repoRoot, ["write-tree"], env);
@@ -111,14 +148,23 @@ export function snapshotCommit(dir: string, message: string): string | null {
 
 /** Every file git considers present: tracked plus untracked-but-not-ignored. */
 export function listFiles(repoRoot: string): string[] {
-  const out = tryGit(repoRoot, ["ls-files", "--cached", "--others", "--exclude-standard"]);
-  return out ? out.split("\n").filter(Boolean) : [];
+  return splitNul(
+    git(repoRoot, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], {}, { raw: true }),
+  );
 }
 
-/** Every file recorded in a commit's tree. */
+/**
+ * Every file recorded in a commit's tree. Throws when git cannot read it: an
+ * empty list would read as "the snapshot was empty" and make every current file
+ * look like an extra to delete.
+ */
 export function treeFiles(repoRoot: string, commit: string): string[] {
-  const out = tryGit(repoRoot, ["ls-tree", "-r", "--name-only", commit]);
-  return out ? out.split("\n").filter(Boolean) : [];
+  return splitNul(git(repoRoot, ["ls-tree", "-r", "-z", "--name-only", commit], {}, { raw: true }));
+}
+
+/** Whether a snapshot commit is still in the object store; git gc may prune it. */
+export function commitExists(repoRoot: string, commit: string): boolean {
+  return tryGit(repoRoot, ["cat-file", "-e", `${commit}^{tree}`]) !== null;
 }
 
 export interface RestoreResult {
@@ -131,22 +177,31 @@ export interface RestoreResult {
 /**
  * Roll the working tree back to a snapshot commit.
  *
- * Restores file *contents* with `git restore --worktree`, which leaves the index
- * alone. Files created after the snapshot are reported as `leftover` and only
+ * Restores file *contents* with `git restore --worktree --overlay`, which leaves
+ * the index alone and deletes nothing. Without `--overlay` git removes every
+ * tracked file missing from the snapshot, including one the user staged after
+ * it. Files created after the snapshot are reported as `leftover` and only
  * deleted when `removeExtra` is set, because deleting a file the user wrote by
  * hand is not something to do implicitly.
+ *
+ * Throws before touching the disk if the snapshot cannot be read.
  */
 export function restoreTo(
   repoRoot: string,
   commit: string,
   opts: { removeExtra: boolean },
 ): RestoreResult {
+  if (!commitExists(repoRoot, commit)) {
+    throw new Error(
+      `Checkpoint commit ${commit} no longer exists in ${repoRoot} (git gc prunes unreferenced commits, by default after two weeks). Nothing was changed.`,
+    );
+  }
   const inSnapshot = new Set(treeFiles(repoRoot, commit));
   const present = listFiles(repoRoot);
   const extra = present.filter((f) => !inSnapshot.has(f));
 
   if (inSnapshot.size > 0) {
-    git(repoRoot, ["restore", "--source", commit, "--worktree", "--", "."]);
+    git(repoRoot, ["restore", "--source", commit, "--worktree", "--overlay", "--", "."]);
   }
 
   const removed: string[] = [];
@@ -221,22 +276,30 @@ export function commitAll(dir: string, message: string): string | null {
   const info = gitInfo(dir);
   if (!info) throw new Error(`${dir} is not a git repository.`);
   git(info.repoRoot, ["add", "-A", "--", "."]);
-  const staged = tryGit(info.repoRoot, ["diff", "--cached", "--name-only"]);
+  const staged = tryGit(info.repoRoot, ["diff", "--cached", "--name-only", "-z"], undefined, { raw: true });
   if (!staged) return null;
   git(info.repoRoot, ["commit", "-m", message, "--no-verify"]);
   return tryGit(info.repoRoot, ["rev-parse", "HEAD"]);
 }
 
 /**
- * Cumulative diff of a worktree against the commit it branched from, including
- * files that are still untracked — the per-turn diff only covers one turn.
+ * Cumulative changes in a worktree against the commit it branched from,
+ * including files that are still untracked — the per-turn diff only covers one
+ * turn. One snapshot serves both the file list and the diff.
  */
-export function diffAgainstBase(dir: string, baseCommit: string): string {
+export function changesAgainstBase(
+  dir: string,
+  baseCommit: string,
+  withDiff: boolean,
+): { files: string[]; diff: string } {
   const info = gitInfo(dir);
-  if (!info) return "";
+  if (!info) return { files: [], diff: "" };
   const snapshot = snapshotCommit(dir, "agent-router: diff snapshot");
-  if (!snapshot) return "";
-  return tryGit(info.repoRoot, ["diff", `${baseCommit}..${snapshot}`]) ?? "";
+  if (!snapshot) return { files: [], diff: "" };
+  return {
+    files: changedFilesBetween(info.repoRoot, baseCommit, snapshot) ?? [],
+    diff: withDiff ? diffBetween(info.repoRoot, baseCommit, snapshot) : "",
+  };
 }
 
 /**
@@ -245,20 +308,14 @@ export function diffAgainstBase(dir: string, baseCommit: string): string {
  * commands, which never produce a patch event.
  */
 export function changedFilesBetween(repoRoot: string, from: string, to: string): string[] | null {
-  const out = tryGit(repoRoot, ["diff", "--name-status", "--no-renames", from, to]);
+  const out = tryGit(repoRoot, ["diff", "--name-status", "-z", "--no-renames", from, to], undefined, {
+    raw: true,
+  });
   // null means git could not answer — distinct from "nothing changed".
-  return out === null ? null : out.split("\n").filter(Boolean);
+  return out === null ? null : nameStatusRows(out);
 }
 
 export function diffBetween(repoRoot: string, from: string, to: string): string {
   return tryGit(repoRoot, ["diff", "--no-renames", from, to]) ?? "";
 }
 
-export function changedFilesAgainstBase(dir: string, baseCommit: string): string[] {
-  const info = gitInfo(dir);
-  if (!info) return [];
-  const snapshot = snapshotCommit(dir, "agent-router: diff snapshot");
-  if (!snapshot) return [];
-  const out = tryGit(info.repoRoot, ["diff", "--name-status", `${baseCommit}..${snapshot}`]);
-  return out ? out.split("\n").filter(Boolean) : [];
-}

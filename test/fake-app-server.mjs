@@ -144,22 +144,49 @@ function fakePng(width, height, rgb, alpha = 255) {
 
 // ---------------------------------------------------------------- requests
 
+// FAKE_STRICT_INIT enforces the handshake the protocol specifies: nothing but
+// `initialize` is served until the client has sent `initialized`. Current Codex
+// is lenient about it, but a client must not rely on that.
+const strictInit = Boolean(process.env.FAKE_STRICT_INIT);
+const initDelayMs = Number(process.env.FAKE_INIT_DELAY_MS ?? 0);
+let initialized = false;
+
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   if (!line.trim()) return;
   const msg = JSON.parse(line);
-  if (msg.id === undefined) return; // notification from the client
+  if (msg.id === undefined) {
+    // notification from the client
+    if (msg.method === "initialized") initialized = true;
+    return;
+  }
   // Server -> client request replies (approvals) arrive with a result; ignore.
   if (msg.method === undefined) return;
 
+  if (strictInit && !initialized && msg.method !== "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, error: { code: -32002, message: "Not initialized" } });
+    return;
+  }
+
   switch (msg.method) {
     case "initialize":
-      reply(msg.id, {
-        userAgent: "fake-app-server/0.155.1 (test)",
-        codexHome: "/tmp/fake-codex",
-        platformFamily: "test",
-        platformOs: "test",
-      });
+      // FAKE_INIT_FAIL_ONCE=<marker file>: the first process to start fails its
+      // handshake; the next one (after the marker exists) succeeds.
+      if (process.env.FAKE_INIT_FAIL_ONCE && !fs.existsSync(process.env.FAKE_INIT_FAIL_ONCE)) {
+        fs.writeFileSync(process.env.FAKE_INIT_FAIL_ONCE, "failed once");
+        send({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "initialize exploded" } });
+        return;
+      }
+      setTimeout(
+        () =>
+          reply(msg.id, {
+            userAgent: "fake-app-server/0.155.1 (test)",
+            codexHome: "/tmp/fake-codex",
+            platformFamily: "test",
+            platformOs: "test",
+          }),
+        initDelayMs,
+      );
       return;
 
     case "model/list":

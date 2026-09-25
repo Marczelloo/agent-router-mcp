@@ -1,6 +1,6 @@
 {
   "name": "codex-router-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server that lets Claude Code delegate coding tasks and image generation to OpenAI Codex, with supervised turns, model policy, quota handoff, git worktree isolation, checkpoints and cross-review.",
   "license": "MIT",
   "author": "Marczelloo",
@@ -36,6 +36,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {

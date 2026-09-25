@@ -2,7 +2,7 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:chil
 import { EventEmitter } from "node:events";
 import path from "node:path";
 import readline from "node:readline";
-import { config, debugLog, log } from "./config.js";
+import { config, debugLog, log, VERSION } from "./config.js";
 import type { InitializeResponse } from "./protocol.js";
 
 interface PendingRequest {
@@ -63,8 +63,10 @@ export class CodexClient extends EventEmitter {
   private retiredProcesses = new WeakSet<ChildProcessWithoutNullStreams>();
 
   async ensureStarted(): Promise<void> {
-    if (this.child && !this.child.killed) return;
+    // `this.child` is set as soon as the process spawns, before the handshake;
+    // a concurrent caller must wait for the handshake, not just the process.
     if (this.starting) return this.starting;
+    if (this.child && !this.child.killed && this.initializeResult) return;
     this.starting = this.start().finally(() => {
       this.starting = null;
     });
@@ -156,11 +158,28 @@ export class CodexClient extends EventEmitter {
       this.retireProcess(child, `codex app-server exited (code=${code} signal=${signal})`, code, signal);
     });
 
+    // A pipe error (EPIPE when the process dies mid-write) is emitted on the
+    // stream, not the child; unhandled, it would take the whole MCP server down.
+    for (const stream of [child.stdin, child.stdout, child.stderr]) {
+      stream.on("error", (err) => {
+        debugLog("app-server pipe error:", err.message);
+        this.retireProcess(child, `codex app-server pipe failed: ${err.message}`);
+        killTree(child);
+      });
+    }
+
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => debugLog("app-server stderr:", chunk.trimEnd()));
 
     const rl = readline.createInterface({ input: child.stdout });
-    rl.on("line", (line) => this.handleLine(line));
+    rl.on("line", (line) => {
+      // A listener that throws must cost one message, not the process.
+      try {
+        this.handleLine(line);
+      } catch (err) {
+        log(`could not handle app-server message: ${(err as Error).message}`);
+      }
+    });
 
     const initTimer = setTimeout(() => {
       this.retireProcess(child, "codex app-server did not complete initialize in time");
@@ -169,11 +188,17 @@ export class CodexClient extends EventEmitter {
 
     try {
       this.initializeResult = (await this.request<InitializeResponse>("initialize", {
-        clientInfo: { name: "agent-router", title: "Agent Router MCP", version: "0.2.0" },
+        clientInfo: { name: "agent-router", title: "Agent Router MCP", version: VERSION },
         capabilities: { experimentalApi: true, requestAttestation: false },
       })) as InitializeResponse;
       this.notify("initialized", {});
       debugLog("initialized:", this.initializeResult.userAgent);
+    } catch (err) {
+      // A process that failed its handshake is not usable; drop it so the next
+      // call starts a fresh one instead of talking to a half-open server.
+      this.retireProcess(child, `codex app-server failed to initialize: ${(err as Error).message}`);
+      killTree(child);
+      throw err;
     } finally {
       clearTimeout(initTimer);
     }
@@ -187,6 +212,10 @@ export class CodexClient extends EventEmitter {
       msg = JSON.parse(trimmed);
     } catch {
       debugLog("non-JSON line from app-server:", trimmed.slice(0, 200));
+      return;
+    }
+    if (!msg || typeof msg !== "object") {
+      debugLog("non-object message from app-server:", trimmed.slice(0, 200));
       return;
     }
 
@@ -264,7 +293,7 @@ export class CodexClient extends EventEmitter {
   }
 
   private write(payload: unknown): void {
-    if (!this.child || this.child.killed) return;
+    if (!this.child || this.child.killed || !this.child.stdin.writable) return;
     this.child.stdin.write(`${JSON.stringify(payload)}\n`);
   }
 

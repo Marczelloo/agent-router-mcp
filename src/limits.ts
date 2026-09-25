@@ -230,3 +230,30 @@ export function isQuotaError(
     msg.includes("quota exhausted")
   );
 }
+
+/** What a task result carries about quota: enough to judge headroom, nothing repeated. */
+export interface CompactLimits {
+  planType: string | null;
+  windows: Pick<NormalizedWindow, "window" | "usedPercent" | "remainingPercent" | "resetsAt" | "rateLimitReached">[];
+  rateLimitReached: boolean;
+}
+
+/**
+ * Task results are read by a model, often many times per task. The full shape
+ * repeats each window up to four times (windows, fiveHour, weekly, tightest);
+ * codex_get_limits still returns it for anyone who needs the detail.
+ */
+export function compactLimits(limits: NormalizedLimits | null): CompactLimits | null {
+  if (!limits) return null;
+  return {
+    planType: limits.planType,
+    windows: limits.windows.map(({ window, usedPercent, remainingPercent, resetsAt, rateLimitReached }) => ({
+      window,
+      usedPercent,
+      remainingPercent,
+      resetsAt,
+      rateLimitReached,
+    })),
+    rateLimitReached: limits.rateLimitReached,
+  };
+}

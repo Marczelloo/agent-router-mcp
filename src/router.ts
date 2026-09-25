@@ -4,10 +4,9 @@ import { CodexClient } from "./codex-client.js";
 import { config, debugLog, log } from "./config.js";
 import {
   addWorktree,
-  changedFilesAgainstBase,
   changedFilesBetween,
+  changesAgainstBase,
   commitAll,
-  diffAgainstBase,
   diffBetween,
   gitInfo,
   removeWorktree,
@@ -23,9 +22,11 @@ import {
   type PreviewMode,
 } from "./images.js";
 import {
+  compactLimits,
   evaluateQuota,
   isQuotaError,
   normalizeLimits,
+  type CompactLimits,
   type NormalizedLimits,
   type QuotaVerdict,
 } from "./limits.js";
@@ -62,6 +63,27 @@ import type {
 } from "./protocol.js";
 
 const DIFF_CHAR_LIMIT = 20_000;
+/**
+ * Output budget for task results. Every result lands in the caller's context,
+ * often once per poll, so nothing in it may grow without bound.
+ */
+const SUMMARY_CHAR_LIMIT = 24_000;
+const ECHO_CHAR_LIMIT = 2_000;
+const COMMAND_CHAR_LIMIT = 400;
+const CHANGED_FILES_LIMIT = 200;
+
+const STORED_DIFF_LIMIT = 200_000;
+
+/** Append to a history list, keeping only the newest `max` entries. */
+function pushBounded(list: string[], value: string, max: number): void {
+  list.push(value);
+  if (list.length > max) list.splice(0, list.length - max);
+}
+
+/** Cut a string to `max` characters, saying how much was left out. */
+export function clip(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max)}… [${text.length - max} more chars]` : text;
+}
 const MODEL_CACHE_TTL_MS = 60_000;
 /** Below this much silence a running turn is plainly alive; no need to re-read it. */
 const QUIET_BEFORE_RECONCILE_MS = 20_000;
@@ -183,10 +205,11 @@ export interface TaskResult {
   threadId: string | null;
   model: string | null;
   reasoningEffort: string | null;
-  originalTask: string;
+  /** Echoes of the request are left out of `running` results: the caller wrote them. */
+  originalTask?: string;
   workingDirectory: string;
-  requestedDirectory: string;
-  scope: string | null;
+  requestedDirectory?: string;
+  scope?: string | null;
   isolation: Isolation;
   worktree: {
     path: string;
@@ -195,10 +218,11 @@ export interface TaskResult {
     baseCommit: string | null;
     removed: boolean;
   } | null;
-  checkpoints: { id: string; label: string; phase: string; createdAt: string }[];
+  checkpoints?: { id: string; label: string; phase: string; createdAt: string }[];
   reviewOf?: { taskId: string | null; target: string } | null;
   summary: string;
   changedFiles: string[];
+  changedFilesTruncated?: number;
   /**
    * Where changedFiles came from: git snapshots of the worktree or working tree
    * (complete, including shell writes), or only what Codex reported.
@@ -216,13 +240,13 @@ export interface TaskResult {
     transparentPercent: number;
   }[];
   failedImages?: { reason: string; resetsAt: string | null }[];
-  commands: string[];
-  plan: { step: string; status: string }[];
+  commands?: string[];
+  plan?: { step: string; status: string }[];
   diff?: string;
   diffTruncated?: boolean;
   remainingWork?: string;
   error?: { message: string; codexErrorInfo: unknown } | null;
-  limits: NormalizedLimits | null;
+  limits?: CompactLimits | null;
   quota?: { state: string; reason: string };
   warning?: string;
   notes?: string[];
@@ -1161,11 +1185,19 @@ export class AgentRouter {
       );
     }
 
+    // The promise is that a restore can itself be undone. Without the safety
+    // snapshot that promise is false, so no snapshot means no restore.
     const safety = this.captureCheckpoint(
       task,
       "pre-restore",
       `state before restoring ${checkpoint.id}`,
+      { force: true },
     );
+    if (!safety) {
+      throw new Error(
+        `Could not snapshot the current state of ${checkpoint.repoRoot} before restoring, so the restore would not be undoable. Nothing was changed.`,
+      );
+    }
     const result = restoreTo(checkpoint.repoRoot, checkpoint.commit, {
       removeExtra: opts.removeUntracked === true,
     });
@@ -1179,10 +1211,8 @@ export class AgentRouter {
       removedFiles: result.removed,
       /** Files that exist now but were not in the checkpoint. */
       leftoverFiles: result.leftover,
-      safetyCheckpoint: safety ? { id: safety.id, label: safety.label } : null,
-      note: safety
-        ? `The pre-restore state was captured as checkpoint "${safety.id}"; restoring that undoes this operation.`
-        : "The pre-restore state could not be captured (not a git repository).",
+      safetyCheckpoint: { id: safety.id, label: safety.label },
+      note: `The pre-restore state was captured as checkpoint "${safety.id}"; restoring that undoes this operation.`,
       ...(result.leftover.length > 0 && opts.removeUntracked !== true
         ? {
             hint: `${result.leftover.length} file(s) created after the checkpoint were left in place. Pass removeUntracked: true to delete them.`,
@@ -1195,8 +1225,9 @@ export class AgentRouter {
     task: TaskRecord,
     phase: Checkpoint["phase"],
     label: string,
+    opts: { force?: boolean } = {},
   ): Checkpoint | null {
-    if (!config.checkpoints || task.kind !== "delegation") return null;
+    if (!opts.force && (!config.checkpoints || task.kind !== "delegation")) return null;
     const info = gitInfo(task.workingDirectory);
     if (!info) return null;
     const commit = snapshotCommit(task.workingDirectory, `agent-router checkpoint: ${label}`);
@@ -1771,19 +1802,19 @@ export class AgentRouter {
       case "agentMessage": {
         // Image turns sometimes echo an empty data URI; it is noise, not a summary.
         const text = typeof item.text === "string" ? item.text.replace(/!\[[^\]]*\]\(data:[^)]*\)/g, "").trim() : "";
-        if (text && !task.agentMessages.includes(text)) task.agentMessages.push(text);
+        if (text && !task.agentMessages.includes(text)) pushBounded(task.agentMessages, text, 20);
         break;
       }
       case "reasoning": {
         const text = [...(item.summary ?? []), ...(item.content ?? [])].join("\n").trim();
-        if (text && !task.reasoningSummaries.includes(text)) task.reasoningSummaries.push(text);
+        if (text && !task.reasoningSummaries.includes(text)) pushBounded(task.reasoningSummaries, text, 20);
         break;
       }
       case "plan":
         if (item.text) task.plan = [{ step: item.text, status: "pending" }];
         break;
       case "commandExecution":
-        if (item.command && !task.commands.includes(item.command)) task.commands.push(item.command);
+        if (item.command && !task.commands.includes(item.command)) pushBounded(task.commands, item.command, 100);
         break;
       case "imageGeneration":
         this.absorbImage(task, item);
@@ -1856,7 +1887,7 @@ export class AgentRouter {
       const task = this.store.byThreadId(params.threadId);
       if (task && params.item?.type === "commandExecution") {
         const command = (params.item as any).command;
-        if (command && !task.commands.includes(command)) task.commands.push(command);
+        if (command && !task.commands.includes(command)) pushBounded(task.commands, command, 100);
       }
     });
 
@@ -1870,7 +1901,9 @@ export class AgentRouter {
     client.on("notification:turn/diff/updated", (params: TurnDiffUpdatedNotification) => {
       const task = this.store.byThreadId(params.threadId);
       if (!task) return;
-      task.diff = params.diff;
+      // Kept only as a fallback when git snapshots are unavailable; the state
+      // file is rewritten on every event, so a huge diff must not live in it.
+      task.diff = clip(params.diff, STORED_DIFF_LIMIT);
       // Backstop for file changes Codex made without a fileChange item.
       for (const file of filesFromDiff(params.diff)) {
         this.store.recordFileFromDiff(task, file);
@@ -2027,10 +2060,10 @@ export class AgentRouter {
     });
 
     if (task.worktree && !task.worktree.removed && task.worktree.baseCommit) {
-      const rows = changedFilesAgainstBase(task.worktree.path, task.worktree.baseCommit);
+      const changes = changesAgainstBase(task.worktree.path, task.worktree.baseCommit, withDiff);
       const root = task.worktree.path;
-      const entries = merge(rows, (file) => this.relativeTo(task, root, file));
-      const diff = withDiff ? diffAgainstBase(task.worktree.path, task.worktree.baseCommit) || task.diff : null;
+      const entries = merge(changes.files, (file) => this.relativeTo(task, root, file));
+      const diff = withDiff ? changes.diff || task.diff : null;
       return finish(entries, "worktree", diff);
     }
 
@@ -2068,7 +2101,7 @@ export class AgentRouter {
       blockedOn: task.blockedOn,
       currentStep: task.plan.find((s) => s.status === "inProgress")?.step ?? null,
       lastMessage: lastMessage ? lastMessage.slice(0, 280) : null,
-      lastCommand: task.commands[task.commands.length - 1] ?? null,
+      lastCommand: task.commands.length > 0 ? clip(task.commands[task.commands.length - 1], COMMAND_CHAR_LIMIT) : null,
     };
   }
 
@@ -2081,6 +2114,10 @@ export class AgentRouter {
     const view = this.changeView(task, opts.includeDiff === true && task.kind === "delegation");
     const diff = view.diff ?? undefined;
     const truncated = Boolean(diff && diff.length > DIFF_CHAR_LIMIT);
+    // A running result is polled repeatedly; it carries progress, not a replay
+    // of the request, the quota snapshot or the command history.
+    const running = status === "running";
+    const hiddenFiles = Math.max(0, view.files.length - CHANGED_FILES_LIMIT);
     const warning =
       this.writeFailureWarning(task, view) ??
       this.transparencyWarning(task) ??
@@ -2092,10 +2129,10 @@ export class AgentRouter {
       threadId: task.threadId,
       model: task.model,
       reasoningEffort: task.reasoningEffort,
-      originalTask: task.originalTask,
+      ...(running ? {} : { originalTask: clip(task.originalTask, ECHO_CHAR_LIMIT) }),
       workingDirectory: task.workingDirectory,
-      requestedDirectory: task.requestedDirectory,
-      scope: task.scope,
+      ...(task.requestedDirectory !== task.workingDirectory ? { requestedDirectory: task.requestedDirectory } : {}),
+      ...(running ? {} : { scope: task.scope === null ? null : clip(task.scope, ECHO_CHAR_LIMIT) }),
       isolation: task.isolation,
       worktree: task.worktree
         ? {
@@ -2106,15 +2143,20 @@ export class AgentRouter {
             removed: task.worktree.removed,
           }
         : null,
-      checkpoints: task.checkpoints.map((c) => ({
-        id: c.id,
-        label: c.label,
-        phase: c.phase,
-        createdAt: c.createdAt,
-      })),
+      ...(running
+        ? {}
+        : {
+            checkpoints: task.checkpoints.map((c) => ({
+              id: c.id,
+              label: c.label,
+              phase: c.phase,
+              createdAt: c.createdAt,
+            })),
+          }),
       ...(task.reviewOf ? { reviewOf: task.reviewOf } : {}),
-      summary: this.summarize(task),
-      changedFiles: view.files,
+      summary: clip(this.summarize(task), SUMMARY_CHAR_LIMIT),
+      changedFiles: hiddenFiles > 0 ? view.files.slice(0, CHANGED_FILES_LIMIT) : view.files,
+      ...(hiddenFiles > 0 ? { changedFilesTruncated: hiddenFiles } : {}),
       ...(task.kind === "delegation" ? { changeSource: view.source } : {}),
       ...(task.failedFileChanges.length > 0
         ? {
@@ -2129,14 +2171,18 @@ export class AgentRouter {
               : {}),
           }
         : {}),
-      commands: task.commands.slice(-25),
-      plan: task.plan,
+      ...(running
+        ? {}
+        : {
+            commands: task.commands.slice(-25).map((c) => clip(c, COMMAND_CHAR_LIMIT)),
+            plan: task.plan,
+          }),
       ...(diff
         ? { diff: truncated ? `${diff.slice(0, DIFF_CHAR_LIMIT)}\n… [truncated]` : diff }
         : {}),
       ...(truncated ? { diffTruncated: true } : {}),
-      error: task.error,
-      limits,
+      ...(task.error || !running ? { error: task.error } : {}),
+      ...(running ? {} : { limits: compactLimits(limits) }),
       ...(opts.quota ? { quota: { state: opts.quota.state, reason: opts.quota.reason } } : {}),
       ...(warning ?? {}),
       ...(task.notes.length > 0 ? { notes: task.notes } : {}),

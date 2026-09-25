@@ -2,14 +2,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { config, log } from "./config.js";
+import { config, log, VERSION } from "./config.js";
 import { AgentRouter } from "./router.js";
 
 const router = new AgentRouter();
 
 const server = new McpServer({
   name: "agent-router",
-  version: "0.2.0",
+  version: VERSION,
 });
 
 type Content =
@@ -394,13 +394,22 @@ async function main(): Promise<void> {
   log("agent-router MCP server ready (stdio)");
 }
 
+let shuttingDown = false;
+
 function shutdown(): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
   router.dispose();
   process.exit(0);
 }
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+// MCP clients end a stdio server by closing its stdin. The app-server child
+// keeps the event loop alive, so without this the router would outlive its
+// client indefinitely — and on Windows a later hard kill skips dispose().
+process.stdin.on("end", shutdown);
+process.stdin.on("close", shutdown);
 // A stray rejection must not take the whole server — and every task — down.
 process.on("unhandledRejection", (reason) => log(`unhandled rejection: ${String(reason)}`));
 

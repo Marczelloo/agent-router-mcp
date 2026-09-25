@@ -1054,12 +1054,165 @@ console.log("state survives a router restart");
     taskId = data.taskId;
     await sleep(400); // let the debounced write land
   });
-  check("the state file is written atomically (no .tmp left behind)", fs.existsSync(stateFile) && !fs.existsSync(`${stateFile}.tmp`));
+  check("the state file is written atomically (no .tmp left behind)", fs.existsSync(stateFile) && fs.readdirSync(stateDir).every((f) => !f.endsWith(".tmp")));
   await withServer("success", { AGENT_ROUTER_STATE_FILE: stateFile }, async (call) => {
     const { data } = await call("codex_task_status", { taskId });
     check("a task running when the router died comes back interrupted", data.status === "interrupted", data.status);
     check("with the reason recorded", (data.interventions ?? []).some((i) => i.action === "app-server-restarted"));
   });
+}
+
+console.log("");
+console.log("the handshake finishes before anything else is sent");
+await withServer("success", { FAKE_STRICT_INIT: "1", FAKE_INIT_DELAY_MS: "400" }, async (call) => {
+  // Two tools called at once on a cold router: the second must wait for the
+  // handshake the first one started, not just for the process to exist.
+  const [models, limits] = await Promise.all([call("codex_get_models"), call("codex_get_limits")]);
+  check("the first concurrent call succeeds", !models.isError, models.text.slice(0, 200));
+  check("the second concurrent call succeeds", !limits.isError, limits.text.slice(0, 200));
+});
+
+console.log("");
+console.log("a failed handshake does not leave a half-open app-server behind");
+{
+  const marker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agent-router-init-")), "failed");
+  await withServer("success", { FAKE_STRICT_INIT: "1", FAKE_INIT_FAIL_ONCE: marker }, async (call) => {
+    const first = await call("codex_get_limits");
+    check("the failing handshake is reported", first.isError && /initialize exploded/.test(first.text), first.text.slice(0, 200));
+    const second = await call("codex_get_limits");
+    check("the next call starts a fresh app-server and succeeds", !second.isError, second.text.slice(0, 200));
+  });
+}
+
+console.log("");
+console.log("the router exits when its client disconnects");
+{
+  const { spawn } = await import("node:child_process");
+  const router = spawn(process.execPath, [entry], {
+    stdio: ["pipe", "pipe", "ignore"],
+    env: {
+      ...process.env,
+      AGENT_ROUTER_CODEX_BIN: process.execPath,
+      AGENT_ROUTER_CODEX_ARGS: JSON.stringify([fakeServer]),
+      AGENT_ROUTER_STATE_FILE: path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agent-router-eof-")), "tasks.json"),
+    },
+  });
+  let out = "";
+  router.stdout.on("data", (d) => (out += d));
+  const send = (m) => router.stdin.write(`${JSON.stringify(m)}\n`);
+  const exited = new Promise((resolve) => router.once("exit", () => resolve(true)));
+  send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+  await sleep(300);
+  send({ jsonrpc: "2.0", method: "notifications/initialized" });
+  // A tool call starts the app-server child, which is what kept the router alive.
+  send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "codex_get_models", arguments: {} } });
+  for (let i = 0; i < 50 && !out.includes('"id":2'); i++) await sleep(100);
+  check("the app-server was running", out.includes('"id":2'));
+  router.stdin.end();
+  const gone = await Promise.race([exited, sleep(5000).then(() => false)]);
+  check("closing stdin shuts the router down", gone === true);
+  if (!gone) router.kill();
+}
+
+console.log("");
+console.log("two sessions share one state file without losing each other's tasks");
+{
+  const stateFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agent-router-shared-")), "tasks.json");
+  const env = { AGENT_ROUTER_STATE_FILE: stateFile };
+  const ids = {};
+  await withServer("success", env, async (callA) => {
+    await withServer("success", env, async (callB) => {
+      ids.a = (await callA("codex_delegate", { task: "Task from session A", workingDirectory: cwd, waitSeconds: 20 })).data.taskId;
+      await sleep(400);
+      const seen = await callB("codex_task_status", { taskId: ids.a });
+      check("a session can look up a task another session created after it started", !seen.isError && seen.data.taskId === ids.a, seen.text.slice(0, 200));
+      ids.b = (await callB("codex_delegate", { task: "Task from session B", workingDirectory: cwd, waitSeconds: 20 })).data.taskId;
+      await sleep(400);
+      // A writes again after B did; a blind overwrite would drop B's task here.
+      ids.c = (await callA("codex_delegate", { task: "Second task from A", workingDirectory: cwd, waitSeconds: 20 })).data.taskId;
+      await sleep(400);
+    });
+  });
+  const stored = JSON.parse(fs.readFileSync(stateFile, "utf8")).tasks.map((t) => t.taskId);
+  check("the state file keeps both sessions' tasks", [ids.a, ids.b, ids.c].every((id) => stored.includes(id)), JSON.stringify({ ids, stored }));
+  check("task ids differ across sessions", new Set([ids.a, ids.b, ids.c]).size === 3);
+  check("no temp files are left behind", fs.readdirSync(path.dirname(stateFile)).every((f) => !f.endsWith(".tmp")));
+}
+
+console.log("");
+console.log("a misconfigured environment fails loudly at startup");
+{
+  let refused = false;
+  try {
+    await withServer("success", { AGENT_ROUTER_ISOLATION: "worktrees" }, async () => {});
+  } catch {
+    refused = true;
+  }
+  check("an unknown isolation value stops the server instead of editing in place", refused);
+}
+
+console.log("");
+console.log("results stay small");
+await withServer("slow", {}, async (call) => {
+  const running = await call("codex_delegate", {
+    task: "A long instruction ".repeat(50),
+    scope: "Only src/",
+    workingDirectory: cwd,
+    waitSeconds: 1,
+  });
+  check("the task is still running", running.data.status === "running", running.data.status);
+  check("a running result does not replay the request", running.data.originalTask === undefined && running.data.scope === undefined);
+  check("a running result carries no quota snapshot", running.data.limits === undefined);
+  check("a running result carries progress", typeof running.data.progress?.health === "string");
+  await call("codex_interrupt", { taskId: running.data.taskId });
+});
+await withServer("success", {}, async (call) => {
+  const done = await call("codex_delegate", { task: "Create hello.txt", workingDirectory: cwd, waitSeconds: 20 });
+  check("a finished result carries the quota windows", Array.isArray(done.data.limits?.windows) && done.data.limits.windows.length > 0);
+  check("each window is stated once", done.data.limits.fiveHour === undefined && done.data.limits.tightest === undefined);
+});
+
+console.log("");
+console.log("checkpoints never lose user files");
+{
+  const git = await import(new URL("../dist/git.js", import.meta.url).href);
+  const { dir, g } = makeRepo();
+  // A file that is tracked although .gitignore matches it.
+  fs.writeFileSync(path.join(dir, ".gitignore"), "ignored/\n*.log\n");
+  fs.writeFileSync(path.join(dir, "tracked.log"), "tracked despite the ignore rule");
+  g(["add", ".gitignore"]);
+  g(["add", "-f", "tracked.log"]);
+  g(["commit", "-q", "-m", "tracked log"]);
+  const cp = git.snapshotCommit(dir, "cp");
+  check("a tracked file matching .gitignore is in the snapshot", git.treeFiles(dir, cp).includes("tracked.log"));
+
+  // Created and staged after the checkpoint: restore must not delete it unasked.
+  fs.writeFileSync(path.join(dir, "staged-later.txt"), "user work");
+  g(["add", "staged-later.txt"]);
+  fs.writeFileSync(path.join(dir, "app.js"), "changed by the agent");
+  const restored = git.restoreTo(dir, cp, { removeExtra: false });
+  check("restore puts content back", fs.readFileSync(path.join(dir, "app.js"), "utf8") === "original");
+  check("a file staged after the checkpoint survives a restore without removeUntracked", fs.existsSync(path.join(dir, "staged-later.txt")));
+  check("and is reported as a leftover", restored.leftover.includes("staged-later.txt"), JSON.stringify(restored.leftover));
+  check("the tracked, ignored file survives", fs.existsSync(path.join(dir, "tracked.log")));
+
+  // Non-ASCII names come back as real paths, not git's quoted octal form.
+  const before = git.snapshotCommit(dir, "before");
+  fs.writeFileSync(path.join(dir, "zażółć.txt"), "x");
+  const after = git.snapshotCommit(dir, "after");
+  const rows = git.changedFilesBetween(dir, before, after);
+  check("non-ASCII file names are reported verbatim", rows.includes("A\tzażółć.txt"), JSON.stringify(rows));
+
+  // A checkpoint whose commit is gone must not be "restored" as an empty tree.
+  const filesBefore = fs.readdirSync(dir).sort().join(",");
+  let threw = false;
+  try {
+    git.restoreTo(dir, "0123456789abcdef0123456789abcdef01234567", { removeExtra: true });
+  } catch (err) {
+    threw = /no longer exists/.test(err.message);
+  }
+  check("restoring a pruned checkpoint refuses", threw);
+  check("and deletes nothing", fs.readdirSync(dir).sort().join(",") === filesBefore);
 }
 
 console.log(`\n${passed} passed, ${failed} failed\n`);

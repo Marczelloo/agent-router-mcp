@@ -170,6 +170,29 @@ None of these may leave a task in `running`.
 Every intervention — reconcile, stall, auto-interrupt, forced stop, restart — is
 recorded on the task under `interventions`, with its reason.
 
+### Lean results
+
+Results are read by a model, often once per poll, so they are kept small:
+
+- A `running` result carries `progress` and `nextStep`, not a replay of the
+  request, the command history or a quota snapshot.
+- A finished result carries a compact `limits` (each window once);
+  `codex_get_limits` still returns the full detail.
+- The diff is capped at 20,000 characters, the summary at 24,000, each command
+  at 400 and `changedFiles` at 200 entries, with the truncation stated.
+
+### Several sessions at once
+
+Every Claude Code session starts its own router, and they share one state file.
+Task ids are unique across processes, each router writes back only the tasks it
+created or changed, and a session can look up a task another session started.
+A task whose turn is running in a different router shows up as `interrupted`
+there: only the router that started a turn can follow it. Finished tasks are
+kept for 30 days, up to 200 of them.
+
+The router exits when its client closes the connection, taking its app-server
+with it.
+
 ## Image generation
 
 `codex_generate_image` drives Codex's built-in image tool.
@@ -287,14 +310,24 @@ codex_checkpoints(taskId)
 codex_restore({ taskId, checkpointId: "cp-1" })
 ```
 
-`codex_restore` rewrites file contents with `git restore --worktree`, leaving the
-index alone. Files created *after* the checkpoint are reported as
-`leftoverFiles` and only deleted when `removeUntracked: true` is passed. Every
-restore first captures the current state and returns it as `safetyCheckpoint`,
-so **a restore is itself undoable**.
+`codex_restore` rewrites file contents with `git restore --worktree --overlay`,
+leaving the index alone and deleting nothing on its own. Files created *after*
+the checkpoint are reported as `leftoverFiles` and only deleted when
+`removeUntracked: true` is passed. Every restore first captures the current
+state and returns it as `safetyCheckpoint`, so **a restore is itself undoable**;
+if that snapshot cannot be taken, the restore is refused.
 
-Checkpoints are dangling commits, not refs. They survive normal use and git's
-default garbage collection, but an explicit `git gc --prune=now` discards them.
+Snapshots start from a copy of your index, so a file that is tracked although
+`.gitignore` matches it is captured like any other.
+
+Checkpoints are dangling commits, not refs, so they never show up in your
+branches or `git log --all`. The flip side: git's garbage collection prunes
+unreferenced commits, by default after two weeks. A restore checks that the
+commit still exists and refuses, changing nothing, if it does not.
+
+Files inside a git submodule are not captured: the snapshot records only the
+submodule's commit. Delegate from inside the submodule if Codex should work
+there with checkpoints.
 
 ## Review
 
@@ -370,7 +403,10 @@ Remove-Item Env:PSModulePath; codex update
 
 ## Configuration
 
-All optional, set as environment variables on the MCP server entry.
+All optional, set as environment variables on the MCP server entry. Values are
+validated at startup: an unknown `AGENT_ROUTER_ISOLATION` or `AGENT_ROUTER_SANDBOX`,
+or a number out of range, stops the server with an error naming the variable,
+rather than being silently ignored.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -398,7 +434,7 @@ All optional, set as environment variables on the MCP server entry.
 | `AGENT_ROUTER_BLOCKED_TIMEOUT_SECONDS` | `60` | How long a turn may wait on an approval or input before it is interrupted. |
 | `AGENT_ROUTER_WATCHDOG_INTERVAL_SECONDS` | `15` | How often the watchdog checks running turns. |
 | `AGENT_ROUTER_INTERRUPT_GRACE_SECONDS` | `10` | How long an interrupt waits for Codex to confirm before forcing. |
-| `AGENT_ROUTER_STATE_FILE` | `~/.agent-router/tasks.json` | Task metadata file, written atomically. |
+| `AGENT_ROUTER_STATE_FILE` | `~/.agent-router/tasks.json` | Task metadata file, written atomically and shared safely between sessions. |
 | `AGENT_ROUTER_DEBUG` | `false` | Mirror app-server stderr and protocol traffic to stderr. |
 
 ## Tests

@@ -105,7 +105,13 @@ Jeśli Codex pogorszył sprawę: `codex_checkpoints(taskId)`, potem
 
 **`codex_restore` nadpisuje pliki na dysku.** Wywołuj je po potwierdzeniu
 z użytkownikiem, chyba że sam poprosił o cofnięcie. Stan sprzed restore jest
-zawsze zapisywany jako nowy checkpoint, więc operacja jest odwracalna.
+zawsze zapisywany jako nowy checkpoint, więc operacja jest odwracalna. Restore
+niczego nie usuwa bez `removeUntracked`, a odmawia (nic nie zmieniając), gdy
+checkpoint zniknął (git gc usuwa je po ~2 tygodniach) albo nie da się zrobić
+snapshotu bezpieczeństwa.
+
+Każda sesja Claude Code ma własny router. Zadanie uruchomione w innej sesji
+widzisz jako `interrupted` — śledzić turę może tylko router, który ją zaczął.
 
 ### 5. Pisz instrukcje jak dla nowego człowieka w zespole
 

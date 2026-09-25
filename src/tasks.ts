@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { config, debugLog } from "./config.js";
@@ -141,11 +142,42 @@ export interface TaskRecord {
 
 let counter = 0;
 
+/**
+ * Every Claude Code session runs its own router and they share one state file,
+ * so a per-process counter alone would hand two sessions the same id within the
+ * same second. The random tail makes ids unique across processes.
+ */
 export function newTaskId(kind: TaskKind = "delegation"): string {
   counter += 1;
   const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
   const prefix = kind === "review" ? "review" : "codex";
-  return `${prefix}-${stamp}-${String(counter).padStart(3, "0")}`;
+  return `${prefix}-${stamp}-${String(counter).padStart(3, "0")}${randomBytes(2).toString("hex")}`;
+}
+
+/** Finished tasks older than this are dropped from memory and the state file. */
+const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+/** At most this many finished tasks are kept; running ones are never dropped. */
+const MAX_FINISHED_TASKS = 200;
+
+/**
+ * A record read from disk whose turn was in flight. This process has no event
+ * stream for it — the router that ran it has exited, or it belongs to another
+ * Claude Code session — so it is shown as interrupted rather than eternally
+ * running. The record on disk is left alone.
+ */
+function adoptForeign(stored: TaskRecord): TaskRecord {
+  const task = migrate(stored);
+  if (task.status === "running" || task.status === "pending") {
+    task.status = "interrupted";
+    task.activeTurnId = null;
+    task.interventions.push({
+      at: new Date().toISOString(),
+      action: "app-server-restarted",
+      reason:
+        "This turn was running in another agent-router process (one that has exited, or another Claude Code session), which this process cannot follow.",
+    });
+  }
+  return task;
 }
 
 /**
@@ -154,6 +186,12 @@ export function newTaskId(kind: TaskKind = "delegation"): string {
  */
 export class TaskStore {
   private tasks = new Map<string, TaskRecord>();
+  /**
+   * Tasks this process created or changed. Only these are written back; every
+   * other record in the state file belongs to a router in another session and
+   * is carried over from disk untouched.
+   */
+  private owned = new Set<string>();
 
   constructor() {
     this.load();
@@ -215,12 +253,20 @@ export class TaskStore {
       imageBaseline: null,
     };
     this.tasks.set(record.taskId, record);
+    this.owned.add(record.taskId);
     this.persist();
     return record;
   }
 
+  /** A task by id — including one another session created since this one started. */
   get(taskId: string): TaskRecord | undefined {
-    return this.tasks.get(taskId);
+    const known = this.tasks.get(taskId);
+    if (known) return known;
+    const stored = this.readDisk().get(taskId);
+    if (!stored) return undefined;
+    const task = adoptForeign(stored);
+    this.tasks.set(task.taskId, task);
+    return task;
   }
 
   byThreadId(threadId: string): TaskRecord | undefined {
@@ -236,6 +282,7 @@ export class TaskStore {
 
   touch(task: TaskRecord): void {
     task.updatedAt = new Date().toISOString();
+    this.owned.add(task.taskId);
     this.persist();
   }
 
@@ -251,6 +298,24 @@ export class TaskStore {
   addCheckpoint(task: TaskRecord, checkpoint: Checkpoint): void {
     task.checkpoints.push(checkpoint);
     this.touch(task);
+  }
+
+  /** Whether a record is past retention. Running tasks never are. */
+  private expired(task: TaskRecord, index: number, now: number): boolean {
+    if (task.status === "running" || task.status === "pending") return false;
+    return index >= MAX_FINISHED_TASKS || now - Date.parse(task.updatedAt) > RETENTION_MS;
+  }
+
+  /** Newest first, finished tasks past retention removed. */
+  private retain(tasks: TaskRecord[]): TaskRecord[] {
+    const now = Date.now();
+    let finished = 0;
+    return tasks
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .filter((t) => {
+        const live = t.status === "running" || t.status === "pending";
+        return live || !this.expired(t, finished++, now);
+      });
   }
 
   /** Merge a file change from a `fileChange` item, keeping one entry per path. */
@@ -297,31 +362,27 @@ export class TaskStore {
     return rel.split("\\").join("/");
   }
 
-  private load(): void {
+  /** The records currently in the state file; empty when missing or unreadable. */
+  private readDisk(): Map<string, TaskRecord> {
+    const records = new Map<string, TaskRecord>();
     try {
-      if (!fs.existsSync(config.stateFile)) return;
-      const raw = JSON.parse(fs.readFileSync(config.stateFile, "utf8")) as {
-        tasks?: TaskRecord[];
-      };
+      if (!fs.existsSync(config.stateFile)) return records;
+      const raw = JSON.parse(fs.readFileSync(config.stateFile, "utf8")) as { tasks?: TaskRecord[] };
       for (const stored of raw.tasks ?? []) {
-        const task = migrate(stored);
-        // A task that was in flight when the router died can never resume its
-        // turn stream; surface it as interrupted rather than eternally running.
-        if (task.status === "running" || task.status === "pending") {
-          task.status = "interrupted";
-          task.activeTurnId = null;
-          task.interventions.push({
-            at: new Date().toISOString(),
-            action: "app-server-restarted",
-            reason: "The router restarted while this turn was running.",
-          });
-        }
-        this.tasks.set(task.taskId, task);
+        if (stored && typeof stored.taskId === "string") records.set(stored.taskId, stored);
       }
-      debugLog(`loaded ${this.tasks.size} task(s) from ${config.stateFile}`);
     } catch (err) {
-      debugLog("could not load task state:", (err as Error).message);
+      debugLog("could not read task state:", (err as Error).message);
     }
+    return records;
+  }
+
+  private load(): void {
+    for (const stored of this.readDisk().values()) {
+      const task = adoptForeign(stored);
+      this.tasks.set(task.taskId, task);
+    }
+    debugLog(`loaded ${this.tasks.size} task(s) from ${config.stateFile}`);
   }
 
   private persistTimer: NodeJS.Timeout | null = null;
@@ -346,10 +407,25 @@ export class TaskStore {
     }
     try {
       fs.mkdirSync(path.dirname(config.stateFile), { recursive: true });
-      // Keep the file bounded; old tasks are of no further use.
-      const tasks = this.list().slice(0, 200);
-      const tmp = `${config.stateFile}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify({ tasks }, null, 2), "utf8");
+      // Merge rather than overwrite: other sessions' routers write this file
+      // too, and their records are theirs. Ours replace only our own.
+      const merged = this.readDisk();
+      for (const id of this.owned) {
+        const task = this.tasks.get(id);
+        if (task) merged.set(id, task);
+      }
+      const tasks = this.retain([...merged.values()]);
+      // Drop what retention removed from memory too, keeping live tasks.
+      const kept = new Set(tasks.map((t) => t.taskId));
+      for (const [id, task] of this.tasks) {
+        if (!kept.has(id) && task.status !== "running" && task.status !== "pending") {
+          this.tasks.delete(id);
+          this.owned.delete(id);
+        }
+      }
+      // Per-process temp name: two routers renaming the same .tmp would race.
+      const tmp = `${config.stateFile}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ tasks }), "utf8");
       // Write-then-rename, so a crash mid-write cannot leave a truncated file.
       fs.renameSync(tmp, config.stateFile);
     } catch (err) {
