@@ -291,14 +291,15 @@ export function changesAgainstBase(
   dir: string,
   baseCommit: string,
   withDiff: boolean,
-): { files: string[]; diff: string } {
+): { files: string[]; diff: string; range: DiffRange | null } {
   const info = gitInfo(dir);
-  if (!info) return { files: [], diff: "" };
+  if (!info) return { files: [], diff: "", range: null };
   const snapshot = snapshotCommit(dir, "agent-router: diff snapshot");
-  if (!snapshot) return { files: [], diff: "" };
+  if (!snapshot) return { files: [], diff: "", range: null };
   return {
     files: changedFilesBetween(info.repoRoot, baseCommit, snapshot) ?? [],
     diff: withDiff ? diffBetween(info.repoRoot, baseCommit, snapshot) : "",
+    range: { repoRoot: info.repoRoot, from: baseCommit, to: snapshot },
   };
 }
 
@@ -317,5 +318,17 @@ export function changedFilesBetween(repoRoot: string, from: string, to: string):
 
 export function diffBetween(repoRoot: string, from: string, to: string): string {
   return tryGit(repoRoot, ["diff", "--no-renames", from, to]) ?? "";
+}
+
+/** Two snapshots whose difference is a task's change set. */
+export interface DiffRange {
+  repoRoot: string;
+  from: string;
+  to: string;
+}
+
+/** The git command that reproduces diffBetween, for callers who read the diff themselves. */
+export function diffCommandFor(range: DiffRange): string {
+  return `git -C "${range.repoRoot}" diff --no-renames ${range.from} ${range.to}`;
 }
 

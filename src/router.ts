@@ -8,10 +8,12 @@ import {
   changesAgainstBase,
   commitAll,
   diffBetween,
+  diffCommandFor,
   gitInfo,
   removeWorktree,
   restoreTo,
   snapshotCommit,
+  type DiffRange,
 } from "./git.js";
 import {
   inspectImage,
@@ -67,9 +69,10 @@ const DIFF_CHAR_LIMIT = 20_000;
  * Output budget for task results. Every result lands in the caller's context,
  * often once per poll, so nothing in it may grow without bound.
  */
-const SUMMARY_CHAR_LIMIT = 24_000;
-const ECHO_CHAR_LIMIT = 2_000;
-const COMMAND_CHAR_LIMIT = 400;
+const SUMMARY_CHAR_LIMIT = 8_000;
+const ECHO_CHAR_LIMIT = 500;
+const COMMAND_CHAR_LIMIT = 200;
+const COMMANDS_SHOWN = 10;
 const CHANGED_FILES_LIMIT = 200;
 
 const STORED_DIFF_LIMIT = 200_000;
@@ -242,8 +245,11 @@ export interface TaskResult {
   failedImages?: { reason: string; resetsAt: string | null }[];
   commands?: string[];
   plan?: { step: string; status: string }[];
+  /** Only when asked for (codex_task_status includeDiff) or in a quota handoff. */
   diff?: string;
   diffTruncated?: boolean;
+  /** Reproduces the diff; append `-- <path>` to read one file's changes. */
+  diffCommand?: string;
   remainingWork?: string;
   error?: { message: string; codexErrorInfo: unknown } | null;
   limits?: CompactLimits | null;
@@ -266,6 +272,15 @@ export interface TaskResult {
   timestamps: { createdAt: string; startedAt: string | null; completedAt: string | null };
   nextStep?: string;
   integration?: string;
+}
+
+interface ChangeView {
+  files: string[];
+  paths: Set<string>;
+  source: "worktree" | "working-tree" | "codex-reported";
+  diff: string | null;
+  /** Set when the change set is a git range, so the caller can read the diff itself. */
+  range: DiffRange | null;
 }
 
 export interface ImageResult {
@@ -963,10 +978,11 @@ export class AgentRouter {
 
   async status(
     taskId: string,
-    opts: { waitSeconds?: number; refresh?: boolean } = {},
+    opts: { waitSeconds?: number; refresh?: boolean; includeDiff?: boolean } = {},
   ): Promise<TaskResult> {
     const task = this.store.get(taskId);
     if (!task) throw new Error(`Unknown taskId "${taskId}".`);
+    const includeDiff = opts.includeDiff === true;
 
     if (task.status === "running") {
       const quietMs = Date.now() - Date.parse(task.lastActivityAt ?? task.startedAt ?? task.createdAt);
@@ -979,12 +995,12 @@ export class AgentRouter {
       const active = this.active.get(task.threadId);
       if (active) {
         const outcome = await withTimeout(active.finished, this.waitBudget(opts.waitSeconds));
-        if (outcome !== TIMED_OUT) return outcome;
+        if (outcome !== TIMED_OUT) return includeDiff && !outcome.diff ? { ...outcome, ...this.diffFields(task) } : outcome;
       }
     }
 
     return this.buildResult(task, task.status, this.cachedLimits(), {
-      includeDiff: true,
+      includeDiff,
       nextStep: task.status === "running" ? this.runningNextStep(task) : this.nextStepFor(task),
     });
   }
@@ -1569,7 +1585,6 @@ export class AgentRouter {
       this.store.touch(task);
       return this.buildResult(task, "failed", this.cachedLimits(), {
         quota: verdict,
-        includeDiff: true,
         nextStep:
           "Codex could not finish. Review the error and either retry with codex_continue or take the task over yourself.",
       });
@@ -1581,7 +1596,6 @@ export class AgentRouter {
     this.store.touch(task);
     return this.buildResult(task, task.status, this.cachedLimits(), {
       quota: verdict,
-      includeDiff: true,
       nextStep: this.nextStepFor(task),
     });
   }
@@ -2040,7 +2054,7 @@ export class AgentRouter {
   private changeView(
     task: TaskRecord,
     withDiff: boolean,
-  ): { files: string[]; paths: Set<string>; source: "worktree" | "working-tree" | "codex-reported"; diff: string | null } {
+  ): ChangeView {
     const kinds: Record<string, string> = { A: "add", D: "delete", M: "update", T: "update" };
     const reported = task.changedFiles.map((c) => ({
       path: c.path,
@@ -2055,11 +2069,17 @@ export class AgentRouter {
       const seen = new Set(fromDisk.map((f) => f.path));
       return [...fromDisk, ...reported.filter((r) => !seen.has(r.path))];
     };
-    const finish = (entries: { path: string; label: string }[], source: "worktree" | "working-tree" | "codex-reported", diff: string | null) => ({
+    const finish = (
+      entries: { path: string; label: string }[],
+      source: ChangeView["source"],
+      diff: string | null,
+      range: DiffRange | null = null,
+    ): ChangeView => ({
       files: entries.map((e) => e.label),
       paths: new Set(entries.map((e) => e.path)),
       source,
       diff,
+      range,
     });
 
     if (task.worktree && !task.worktree.removed && task.worktree.baseCommit) {
@@ -2067,7 +2087,7 @@ export class AgentRouter {
       const root = task.worktree.path;
       const entries = merge(changes.files, (file) => this.relativeTo(task, root, file));
       const diff = withDiff ? changes.diff || task.diff : null;
-      return finish(entries, "worktree", diff);
+      return finish(entries, "worktree", diff, changes.range);
     }
 
     if (task.kind === "delegation" && task.status !== "running") {
@@ -2078,12 +2098,32 @@ export class AgentRouter {
         if (rows !== null) {
           const entries = merge(rows, (file) => this.relativeTo(task, pre.repoRoot, file));
           const diff = withDiff ? diffBetween(pre.repoRoot, pre.commit, post.commit) || task.diff : null;
-          return finish(entries, "working-tree", diff);
+          return finish(entries, "working-tree", diff, { repoRoot: pre.repoRoot, from: pre.commit, to: post.commit });
         }
       }
     }
 
     return finish(reported, "codex-reported", withDiff ? task.diff : null);
+  }
+
+  /**
+   * The diff is the largest thing a result can carry, so it is sent only on
+   * request. Every result with a git-backed change set carries the command that
+   * reproduces it instead, so the caller can read just the files it reviews.
+   */
+  private diffPart(view: ChangeView): Pick<TaskResult, "diff" | "diffTruncated" | "diffCommand"> {
+    const diff = view.diff ?? "";
+    const truncated = diff.length > DIFF_CHAR_LIMIT;
+    return {
+      ...(diff ? { diff: truncated ? `${diff.slice(0, DIFF_CHAR_LIMIT)}\n… [truncated]` : diff } : {}),
+      ...(truncated ? { diffTruncated: true } : {}),
+      ...(view.range && view.files.length > 0 ? { diffCommand: diffCommandFor(view.range) } : {}),
+    };
+  }
+
+  /** The diff of a task that has already been summarised without one. */
+  private diffFields(task: TaskRecord): Pick<TaskResult, "diff" | "diffTruncated" | "diffCommand"> {
+    return task.kind === "delegation" ? this.diffPart(this.changeView(task, true)) : {};
   }
 
   /** A repo-relative git path, expressed relative to the task's working directory when inside it. */
@@ -2115,8 +2155,6 @@ export class AgentRouter {
     opts: { nextStep?: string; quota?: QuotaVerdict; includeDiff?: boolean } = {},
   ): TaskResult {
     const view = this.changeView(task, opts.includeDiff === true && task.kind === "delegation");
-    const diff = view.diff ?? undefined;
-    const truncated = Boolean(diff && diff.length > DIFF_CHAR_LIMIT);
     // A running result is polled repeatedly; it carries progress, not a replay
     // of the request, the quota snapshot or the command history.
     const running = status === "running";
@@ -2177,13 +2215,10 @@ export class AgentRouter {
       ...(running
         ? {}
         : {
-            commands: task.commands.slice(-25).map((c) => clip(c, COMMAND_CHAR_LIMIT)),
+            commands: task.commands.slice(-COMMANDS_SHOWN).map((c) => clip(c, COMMAND_CHAR_LIMIT)),
             plan: task.plan,
           }),
-      ...(diff
-        ? { diff: truncated ? `${diff.slice(0, DIFF_CHAR_LIMIT)}\n… [truncated]` : diff }
-        : {}),
-      ...(truncated ? { diffTruncated: true } : {}),
+      ...this.diffPart(view),
       ...(task.error || !running ? { error: task.error } : {}),
       ...(running ? {} : { limits: compactLimits(limits) }),
       ...(opts.quota ? { quota: { state: opts.quota.state, reason: opts.quota.reason } } : {}),

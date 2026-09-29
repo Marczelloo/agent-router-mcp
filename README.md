@@ -78,7 +78,7 @@ without it the model sees twelve tools and no guidance:
 >   there is uncommitted work that must not be lost.
 > - `status: "running"` means Codex is still working. Wait with
 >   `codex_task_status({ taskId, waitSeconds })`; never delegate the same task twice.
-> - Always review what Codex produced — changed files, diff, then the code — and
+> - Always review what Codex produced — changed files, the diff (via `diffCommand`), then the code — and
 >   check it stayed inside `scope`. Send corrections through `codex_continue`.
 > - When you need a real image, use `codex_generate_image`, then look at the
 >   preview before using it.
@@ -97,7 +97,7 @@ without it the model sees twelve tools and no guidance:
 | `codex_get_limits()` | Quota windows normalized by duration, with a delegation verdict. |
 | `codex_delegate({ task, workingDirectory, scope?, model?, reasoningEffort?, isolation?, branch?, waitSeconds?, timeoutSeconds? })` | Run a task in a fresh Codex thread. |
 | `codex_continue({ taskId, instruction, ... })` | Follow-up instruction on an existing thread, context intact. |
-| `codex_task_status({ taskId?, waitSeconds?, refresh? })` | Status and live progress; `waitSeconds` blocks until the task finishes. |
+| `codex_task_status({ taskId?, waitSeconds?, refresh?, includeDiff? })` | Status and live progress; `waitSeconds` blocks until the task finishes. The diff only with `includeDiff`. |
 | `codex_interrupt(taskId)` | Stop the in-flight turn — guaranteed to leave `running`; the thread survives. |
 | `codex_review({ workingDirectory?, taskId?, target?, ... })` | Read-only review of your work or of a Codex task. |
 | `codex_generate_image({ prompt, outputPath?, count?, size?, referenceImages?, ... })` | Generate images; files on disk plus a preview. |
@@ -178,8 +178,14 @@ Results are read by a model, often once per poll, so they are kept small:
   request, the command history or a quota snapshot.
 - A finished result carries a compact `limits` (each window once);
   `codex_get_limits` still returns the full detail.
-- The diff is capped at 20,000 characters, the summary at 24,000, each command
-  at 400 and `changedFiles` at 200 entries, with the truncation stated.
+- No result inlines the diff by default — it is the largest field and was
+  re-sent on every poll. A result with a git-backed change set carries
+  `diffCommand` instead; append `-- <path>` to read one file's changes.
+  `codex_task_status({ taskId, includeDiff: true })` returns the diff itself
+  (a quota handoff always includes it).
+- The diff is capped at 20,000 characters, the summary at 8,000, the request
+  echo at 500, the last 10 commands at 200 each and `changedFiles` at 200
+  entries, with the truncation stated.
 
 ### Several sessions at once
 

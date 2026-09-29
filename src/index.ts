@@ -201,7 +201,7 @@ server.registerTool(
   {
     title: "Check or wait for a Codex task",
     description:
-      "Current state of a task: status, progress (health, running/idle seconds, current step, last message and command), changed files, diff, images, worktree, checkpoints, and any watchdog interventions. Pass waitSeconds to block until the task finishes instead of polling in a loop. Omit taskId to list all tasks.",
+      "Current state of a task: status, progress (health, running/idle seconds, current step, last message and command), changed files, images, worktree, checkpoints, and any watchdog interventions. The diff is left out unless you pass includeDiff; results carry diffCommand instead — run it with `-- <path>` to read only the files you review. Pass waitSeconds to block until the task finishes instead of polling in a loop. Omit taskId to list all tasks.",
     inputSchema: {
       taskId: z.string().optional().describe("Task to inspect. Omit to list every task this router knows about."),
       waitSeconds: z
@@ -214,12 +214,18 @@ server.registerTool(
         .boolean()
         .optional()
         .describe("Re-read the thread from Codex before answering, even if events are still flowing."),
+      includeDiff: z
+        .boolean()
+        .optional()
+        .describe(
+          "Include the full diff (up to 20k characters). Costly in context — prefer diffCommand for the files you need.",
+        ),
     },
   },
-  async ({ taskId, waitSeconds, refresh }, extra) =>
+  async ({ taskId, waitSeconds, refresh, includeDiff }, extra) =>
     guard(() =>
       taskId
-        ? withProgress(extra, "Waiting for Codex", () => router.status(taskId, { waitSeconds, refresh }))
+        ? withProgress(extra, "Waiting for Codex", () => router.status(taskId, { waitSeconds, refresh, includeDiff }))
         : { tasks: router.listTasks() },
     ),
 );

@@ -16,7 +16,7 @@ Odpowiadasz za końcowy rezultat, także za kod — i obrazy — które zrobił 
 | `codex_get_limits()` | Limity użycia znormalizowane po długości okna (`5h`, `weekly`, …): `usedPercent`, `remainingPercent`, `resetsAt`, `rateLimitReached` + werdykt czy można delegować. |
 | `codex_delegate({ task, workingDirectory, scope?, model?, reasoningEffort?, isolation?, branch?, waitSeconds?, timeoutSeconds? })` | Zleć Codexowi zadanie w nowym wątku. |
 | `codex_continue({ taskId, instruction, model?, reasoningEffort?, waitSeconds?, timeoutSeconds? })` | Dopisz instrukcję do istniejącego wątku Codexa (zachowuje cały kontekst). |
-| `codex_task_status({ taskId?, waitSeconds?, refresh? })` | Stan i postęp zadania; `waitSeconds` czeka, aż zadanie się skończy. Bez `taskId` — lista wszystkich zadań. |
+| `codex_task_status({ taskId?, waitSeconds?, refresh?, includeDiff? })` | Stan i postęp zadania; `waitSeconds` czeka, aż zadanie się skończy. Diff tylko z `includeDiff`. Bez `taskId` — lista wszystkich zadań. |
 | `codex_interrupt(taskId)` | Przerwij turę. **Zawsze** wyprowadza zadanie z `running`. Wątek zostaje. |
 | `codex_review({ workingDirectory?, taskId?, target?, branch?, commit?, instructions?, model?, reasoningEffort? })` | Poproś Codexa o review — swojego kodu albo pracy innego taska. Read-only. |
 | `codex_generate_image({ prompt, outputPath?, count?, size?, transparentBackground?, referenceImages?, preview? })` | Wygeneruj obraz; plik na dysku + podgląd, który możesz obejrzeć. |
@@ -152,7 +152,9 @@ nie da. Wszystkie interwencje są w `interventions` z powodem. Ty działasz tak:
 
 ### 8. Zawsze rób review po Codexie
 
-Po `status: "completed"` przejrzyj `changedFiles` i `diff`, a potem sam kod.
+Po `status: "completed"` przejrzyj `changedFiles`, potem diff — przez
+`diffCommand` z `-- <plik>` dla plików, które oglądasz (pełny diff tylko przez
+`codex_task_status({ taskId, includeDiff: true })`, bo zjada kontekst) — a potem sam kod.
 Traktuj to jak code review juniora: sprawdź poprawność, zgodność z konwencjami
 repo i to, czy Codex nie wyszedł poza `scope`. Uruchom testy.
 

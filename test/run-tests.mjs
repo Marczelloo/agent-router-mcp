@@ -206,7 +206,7 @@ await withServer("success", {}, async (call) => {
   );
   check("commands collected", data.commands?.includes("cat hello.txt"));
   check("plan collected", data.plan?.length === 2);
-  check("diff returned", typeof data.diff === "string" && data.diff.includes("hello from codex"));
+  check("the diff is left out unless asked for", data.diff === undefined);
   check("originalTask preserved", data.originalTask === "Create hello.txt");
   check("scope preserved", data.scope === "only hello.txt");
   check("timestamps present", Boolean(data.timestamps?.createdAt && data.timestamps?.completedAt));
@@ -214,6 +214,13 @@ await withServer("success", {}, async (call) => {
   const status = await call("codex_task_status", { taskId: data.taskId });
   check("codex_task_status finds the task", status.data.taskId === data.taskId);
   check("status survives as completed", status.data.status === "completed");
+  check("status leaves the diff out too", status.data.diff === undefined);
+
+  const withDiff = await call("codex_task_status", { taskId: data.taskId, includeDiff: true });
+  check(
+    "includeDiff returns the diff",
+    typeof withDiff.data.diff === "string" && withDiff.data.diff.includes("hello from codex"),
+  );
 
   const list = await call("codex_task_status");
   check("codex_task_status with no id lists tasks", Array.isArray(list.data.tasks));
@@ -1029,7 +1036,12 @@ await withServer("shell_write", {}, async (call) => {
     JSON.stringify(data.changedFiles),
   );
   check("the source is the working tree, not Codex's own list", data.changeSource === "working-tree", data.changeSource);
-  check("the diff shows it", /shell\.txt/.test(data.diff ?? ""));
+  check("the diff is not inlined", data.diff === undefined);
+  check("a diffCommand is offered instead", typeof data.diffCommand === "string", data.diffCommand);
+  const viaCommand = data.diffCommand ? execFileSync(data.diffCommand, { shell: true, encoding: "utf8" }) : "";
+  check("and running it shows the file", /shell\.txt/.test(viaCommand));
+  const withDiff = await call("codex_task_status", { taskId: data.taskId, includeDiff: true });
+  check("includeDiff shows it", /shell\.txt/.test(withDiff.data.diff ?? ""));
   check("no false claim that nothing was written", !/could not write any files/.test(data.warning ?? ""), data.warning);
   check("no warning at all — the rejected patch was superseded", !data.warning, data.warning);
 

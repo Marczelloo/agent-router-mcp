@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed
+
+- **Results no longer inline the diff.** `codex_task_status` re-sent up to
+  20,000 characters of diff on every poll, including while the task was still
+  running, and every finished `codex_delegate` / `codex_continue` carried it
+  too — most of what the router put into the caller's context. The diff now
+  comes only with `codex_task_status({ includeDiff: true })` or in a quota
+  handoff; other results carry `diffCommand`, a git command that reproduces it
+  (append `-- <path>` for one file). Finished results also echo less: the
+  request and scope up to 500 characters, the last 10 commands at 200 each,
+  the summary up to 8,000.
+
 ### Added
 
 - **Public status file.** Every state write now also writes
